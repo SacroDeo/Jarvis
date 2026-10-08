@@ -1,0 +1,96 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.serialization'
+}
+
+// Optional preconfiguration: a gitignored keys.properties can bake in a default
+// Worker URL + token so a build ships ready-to-connect. Repo stays clean.
+def keysFile = rootProject.file("keys.properties")
+def keysProps = new Properties()
+if (keysFile.exists()) keysProps.load(new FileInputStream(keysFile))
+def jvEscape = { String s -> (s ?: "").replace("\\", "\\\\").replace("\"", "\\\"") }
+def defWorkerUrl = jvEscape(keysProps.getProperty("JARVIS_WORKER_URL", ""))
+def defWorkerToken = jvEscape(keysProps.getProperty("JARVIS_WORKER_TOKEN", ""))
+def defElevenKey = jvEscape(keysProps.getProperty("JARVIS_ELEVEN_KEY", ""))
+def defElevenVoice = jvEscape(keysProps.getProperty("JARVIS_ELEVEN_VOICE", ""))
+
+android {
+    namespace 'dk.foss.jarvis'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "dk.foss.jarvis"
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+        vectorDrawables {
+            useSupportLibrary true
+        }
+        ndk {
+            // ONNX Runtime ships native libs per-ABI; real phones are ARM.
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+        buildConfigField "String", "DEFAULT_WORKER_URL", "\"${defWorkerUrl}\""
+        buildConfigField "String", "DEFAULT_WORKER_TOKEN", "\"${defWorkerToken}\""
+        buildConfigField "String", "DEFAULT_ELEVEN_KEY", "\"${defElevenKey}\""
+        buildConfigField "String", "DEFAULT_ELEVEN_VOICE", "\"${defElevenVoice}\""
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    buildFeatures {
+        compose true
+        buildConfig true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.10'
+    }
+    packaging {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+    }
+}
+
+dependencies {
+    implementation platform('androidx.compose:compose-bom:2024.02.02')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.activity:activity-compose:1.8.2'
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0'
+    implementation 'androidx.datastore:datastore-preferences:1.0.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.squareup.okhttp3:okhttp-sse:4.12.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'xyz.rementia:openwakeword:0.1.5' // wake word (package com.rementia.openwakeword.lib)
+    // Explicit ONNX Runtime dep so NnapiWakeEngine can use OrtSession.SessionOptions.addNnapi()
+    // directly. This is already a transitive dep via openwakeword:0.1.5, but declaring it
+    // explicitly ensures the version is pinned and the API is on our compile classpath.
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.18.0'
+
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+}

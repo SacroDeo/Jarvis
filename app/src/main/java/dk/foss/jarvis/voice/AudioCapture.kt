@@ -1,0 +1,204 @@
+package dk.foss.jarvis.voice
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.RandomAccessFile
+import kotlin.math.sqrt
+
+/**
+ * Records mic audio to a 16 kHz mono WAV with energy-based voice-activity
+ * detection: it waits for speech, then stops after a short trailing silence.
+ * Callbacks are delivered on the main thread.
+ */
+class AudioCapture(private val context: Context) {
+
+    @Volatile private var active = false
+    @Volatile private var generation = 0
+    private var thread: Thread? = null
+    private val main = Handler(Looper.getMainLooper())
+
+    @SuppressLint("MissingPermission") // caller ensures RECORD_AUDIO is granted
+    fun start(
+        onSpeechStart: () -> Unit,
+        onResult: (File?) -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        if (active) return
+        active = true
+        val gen = ++generation
+        thread = Thread {
+            var record: AudioRecord? = null
+            try {
+                val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
+                val bufSize = maxOf(minBuf, SAMPLE_RATE) // ~1s internal headroom
+                record = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    SAMPLE_RATE, CHANNEL, ENCODING, bufSize,
+                )
+                if (record.state != AudioRecord.STATE_INITIALIZED) {
+                    post { onError("Microphone unavailable") }
+                    return@Thread
+                }
+
+                val pcm = ByteArrayOutputStream()
+                val frame = ShortArray(FRAME_SAMPLES) // ~50ms frames for snappy onset
+                // Pre-roll ring buffer: keep the most recent frames so that when speech
+                // is detected we can PREPEND them — otherwise the start of the first
+                // word (the frames before detection) is lost.
+                val preRoll = ArrayDeque<ByteArray>()
+                var preRollMs = 0
+                record.startRecording()
+
+                var speechStarted = false
+                var speechFrames = 0
+                var silenceMs = 0
+                var elapsedMs = 0
+                var notifiedStart = false
+
+                while (active && gen == generation) {
+                    val n = record.read(frame, 0, frame.size)
+                    if (n <= 0) continue
+                    val frameMs = n * 1000 / SAMPLE_RATE
+                    elapsedMs += frameMs
+
+                    val rms = rms(frame, n)
+                    val loud = rms > SPEECH_RMS
+
+                    val bytes = ByteArray(n * 2)
+                    for (i in 0 until n) {
+                        bytes[i * 2] = (frame[i].toInt() and 0xFF).toByte()
+                        bytes[i * 2 + 1] = (frame[i].toInt() shr 8 and 0xFF).toByte()
+                    }
+
+                    if (loud) {
+                        speechFrames++
+                        if (speechFrames >= 2) speechStarted = true
+                        silenceMs = 0
+                    } else if (speechStarted) {
+                        silenceMs += frameMs
+                    }
+
+                    if (speechStarted) {
+                        if (!notifiedStart) {
+                            notifiedStart = true
+                            // Flush the pre-roll first so the word onset is included.
+                            while (preRoll.isNotEmpty()) pcm.write(preRoll.removeFirst())
+                            post { onSpeechStart() }
+                        }
+                        pcm.write(bytes)
+                    } else {
+                        // Not speaking yet — keep this frame in the pre-roll (capped).
+                        preRoll.addLast(bytes)
+                        preRollMs += frameMs
+                        while (preRollMs > PREROLL_MS && preRoll.isNotEmpty()) {
+                            preRoll.removeFirst()
+                            preRollMs -= frameMs
+                        }
+                    }
+
+                    val ended = speechStarted && silenceMs >= END_SILENCE_MS
+                    val tooLong = elapsedMs >= MAX_MS
+                    val noSpeech = !speechStarted && elapsedMs >= NO_SPEECH_MS
+                    if (ended || tooLong || noSpeech) break
+                }
+
+                record.stop()
+
+                // Require enough *real* loud speech (not just bytes — pre-roll padding
+                // would inflate the byte count) before transcribing, else treat as
+                // no-speech. Stops ambient noise/silence blips from being sent to
+                // Scribe (which hallucinates phantom phrases on near-silence).
+                val enough = speechStarted && speechFrames >= MIN_SPEECH_FRAMES
+                val superseded = gen != generation
+                if (superseded) {
+                    // A newer capture took over — don't deliver a stale result.
+                } else if (!enough) {
+                    post { onResult(null) }
+                } else {
+                    val file = writeWav(pcm.toByteArray())
+                    post { onResult(file) }
+                }
+            } catch (e: Exception) {
+                if (gen == generation) post { onError(e.message ?: "Recording failed") }
+            } finally {
+                // Only clear the shared flag if we're still the current generation,
+                // so a stale thread can't disarm a newer capture.
+                if (gen == generation) active = false
+                runCatching { record?.release() }
+            }
+        }.also { it.start() }
+    }
+
+    /** Stop recording; whatever was captured so far is returned via onResult. */
+    fun stop() { active = false }
+
+    /** Abort with no result. */
+    fun cancel() {
+        active = false
+        thread = null
+    }
+
+    private fun rms(buf: ShortArray, n: Int): Double {
+        var sum = 0.0
+        for (i in 0 until n) { val v = buf[i].toDouble(); sum += v * v }
+        return sqrt(sum / n)
+    }
+
+    private fun writeWav(pcm: ByteArray): File {
+        val file = File(context.cacheDir, "stt_${pcm.size}.wav")
+        RandomAccessFile(file, "rw").use { out ->
+            val dataLen = pcm.size
+            val totalLen = dataLen + 36
+            val byteRate = SAMPLE_RATE * 2
+            val header = ByteArray(44)
+            fun putInt(off: Int, v: Int) {
+                header[off] = (v and 0xFF).toByte()
+                header[off + 1] = (v shr 8 and 0xFF).toByte()
+                header[off + 2] = (v shr 16 and 0xFF).toByte()
+                header[off + 3] = (v shr 24 and 0xFF).toByte()
+            }
+            fun putShort(off: Int, v: Int) {
+                header[off] = (v and 0xFF).toByte()
+                header[off + 1] = (v shr 8 and 0xFF).toByte()
+            }
+            "RIFF".toByteArray().copyInto(header, 0)
+            putInt(4, totalLen)
+            "WAVE".toByteArray().copyInto(header, 8)
+            "fmt ".toByteArray().copyInto(header, 12)
+            putInt(16, 16)          // PCM fmt chunk size
+            putShort(20, 1)         // audio format = PCM
+            putShort(22, 1)         // channels = mono
+            putInt(24, SAMPLE_RATE)
+            putInt(28, byteRate)
+            putShort(32, 2)         // block align
+            putShort(34, 16)        // bits per sample
+            "data".toByteArray().copyInto(header, 36)
+            putInt(40, dataLen)
+            out.write(header)
+            out.write(pcm)
+        }
+        return file
+    }
+
+    private fun post(block: () -> Unit) = main.post(block)
+
+    private companion object {
+        const val SAMPLE_RATE = 16000
+        const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
+        const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
+        const val FRAME_SAMPLES = SAMPLE_RATE / 20 // 50ms frames
+        const val PREROLL_MS = 600        // audio kept before detection so word onsets aren't clipped
+        const val SPEECH_RMS = 1000.0     // RMS above this = speech (higher = less noise-trigger)
+        const val END_SILENCE_MS = 1800   // trailing silence that ends a turn (allows mid-sentence pauses)
+        const val NO_SPEECH_MS = 8000     // give up if nobody speaks
+        const val MAX_MS = 30000          // hard cap on a single utterance
+        const val MIN_SPEECH_FRAMES = 6   // ~300ms of actual loud speech required (50ms frames)
+    }
+}

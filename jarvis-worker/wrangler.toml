@@ -1,0 +1,22 @@
+name = "jarvis-worker"
+main = "src/index.ts"
+compatibility_date = "2024-10-05"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+LLM_PROVIDER = "groq"
+LLM_BASE_URL = "https://api.groq.com/openai/v1"
+LLM_MODEL = "openai/gpt-oss-120b"
+
+# Rate limiting (requests per minute per IP)
+RATE_LIMIT_RPM = "60"
+
+# Request timeout in milliseconds
+REQUEST_TIMEOUT_MS = "30000"
+
+# CORS origin - set to your Android app's origin or "*" for development
+CORS_ORIGIN = "*"
+
+# Worker secret names (configured via `wrangler secret put`):
+# LLM_API_KEY - Groq or OpenRouter API key
+# JARVIS_BEARER_TOKEN - Bearer token for authenticating Android client re

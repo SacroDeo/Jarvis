@@ -1,0 +1,31 @@
+# Copy this file to .dev.vars and fill in your values
+# NEVER commit .dev.vars to version control!
+
+# LLM Provider: "groq" or "openrouter"
+LLM_PROVIDER=groq
+
+# LLM API Key (get from https://console.groq.com/keys or https://openrouter.ai/keys)
+LLM_API_KEY=your-llm-api-key-here
+
+# LLM Base URL (auto-set based on provider, but can override)
+# Groq: https://api.groq.com/openai/v1
+# OpenRouter: https://openrouter.ai/api/v1
+LLM_BASE_URL=https://api.groq.com/openai/v1
+
+# LLM Model (choose based on provider)
+# Groq: llama-3.1-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768
+# OpenRouter: anthropic/claude-3.5-sonnet, meta-llama/llama-3.1-70b-instruct, etc.
+LLM_MODEL=llama-3.1-70b-versatile
+
+# JARVIS Bearer Token (generate a secure random token)
+# Example: openssl rand -hex 32
+JARVIS_BEARER_TOKEN=your-secure-bearer-token-here
+
+# Rate limit: requests per minute per IP
+RATE_LIMIT_RPM=60
+
+# Request timeout in milliseconds
+REQUEST_TIMEOUT_MS=30000
+
+# CORS Origin - set to your Android app's origin or "*" for development
+CORS_ORIGIN=*

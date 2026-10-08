@@ -1,0 +1,81 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  # Allow triggering the build manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Source ───────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. JDK 17 (matches project compileOptions / jvmTarget) ─────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          # Cache the Gradle dependency cache between runs to speed up builds
+          cache: gradle
+
+      # ── 3. Gradle wrapper permissions ──────────────────────────────────────
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      # ── 4. Android SDK ─────────────────────────────────────────────────────
+      # GitHub's ubuntu-latest runner ships with the Android SDK.
+      # Point local.properties at it so Gradle can find the SDK without
+      # a committed local.properties (which is .gitignored).
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses \
+            >/dev/null 2>&1 || true
+
+      - name: Install required Android SDK components
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools" \
+            >/dev/null
+
+      # ── 5. Memory ──────────────────────────────────────────────────────────
+      # The project gradle.properties caps the JVM at 1 GB (-Xmx1024m), which
+      # causes an OOM crash in the Kotlin compiler; 4 GB is sufficient for CI.
+      # GitHub's ubuntu-latest runner has 7 GB of RAM; raising the heap here
+      # fixes the build.  In Java Properties, the last value for a duplicate
+      # key wins, so appending overrides the existing setting cleanly without
+      # modifying the committed file.  This edit lives only in the CI workspace.
+      - name: Increase Gradle JVM heap for CI
+        run: |
+          echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8' \
+            >> gradle.properties
+          echo 'org.gradle.daemon=false' >> gradle.properties
+
+      # ── 6. Build ───────────────────────────────────────────────────────────
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      # ── 7. Artifact ────────────────────────────────────────────────────────
+      # The APK is uploaded as a GitHub Actions artifact and can be downloaded
+      # from the workflow run page.  It is retained for 30 days.
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          # Fail the job explicitly if the APK was not produced
+          if-no-files-found: error
+          retention-days: 30
