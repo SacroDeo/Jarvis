@@ -136,9 +136,10 @@ fun ConversationScreen(vm: ConversationViewModel, assistTrigger: Int, onExit: ()
 
     DeepSpaceBackground(active = isActive) {
         Box(Modifier.fillMaxSize().statusBarsPadding().padding(20.dp)) {
-            // Top-right close button
+            // Top-right close button — stopAll() halts TTS immediately so the user
+            // doesn't hear speech continue during the brief gap before onDispose fires.
             IconButton(
-                onClick = onExit,
+                onClick = { vm.stopAll(); onExit() },
                 modifier = Modifier.align(Alignment.TopEnd),
             ) {
                 Icon(
@@ -308,7 +309,7 @@ private fun IdleContent(hasPermission: Boolean, hint: String?, onMicTap: () -> U
                 }
             } else {
                 Text(
-                    text = "Tap, or say \"Hey Jarvis\"",
+                    text = "Tap, or say \"Jarvis\"",
                     fontFamily = DmSans,
                     fontWeight = FontWeight.Normal,
                     fontSize = 14.sp,

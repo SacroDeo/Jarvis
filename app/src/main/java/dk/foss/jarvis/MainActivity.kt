@@ -86,7 +86,12 @@ class MainActivity : ComponentActivity() {
                         ConversationScreen(
                             vm = cvm,
                             assistTrigger = assistEpoch,
-                            onExit = { screen = Screen.Chat },
+                            // Move the task to the background (home screen) instead of merely
+                            // navigating to the Chat screen.  The activity is preserved in
+                            // recents; WakeWordService and VoiceInteractionService keep running.
+                            // When the wake word fires again, onNewIntent bumps assistEpoch and
+                            // LaunchedEffect returns to Screen.Conversation cleanly.
+                            onExit = { screen = Screen.Chat; moveTaskToBack(true) },
                         )
                     }
                     Screen.History -> {

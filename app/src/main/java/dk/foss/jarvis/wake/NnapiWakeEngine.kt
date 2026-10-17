@@ -106,6 +106,10 @@ class NnapiWakeEngine(
         // 0.02 ≈ RMS 655 shorts — comfortably within the confirmed speech range (500-1275).
         // Used only by the one-shot NNAPI vs CPU mel diagnostic.
         const val RMS_DIAG_THRESHOLD = 0.02f
+
+        // How many full-pipeline chunks between per-model timing log lines.
+        // 150 chunks × 80 ms = ~12 s.  Set to 63 (≈ 5 s) for faster initial feedback.
+        const val TIMING_LOG_INTERVAL = 150
     }
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
@@ -193,6 +197,18 @@ class NnapiWakeEngine(
     private var melCpuSessForDiag: OrtSession? = null
     @Volatile private var melDiagDone = false
 
+    // ── Per-model inference timing accumulators (diagnostic only) ────────────
+    // Accumulate wall-clock nanoseconds for each model.run() call across
+    // TIMING_LOG_INTERVAL full-pipeline chunks (all three models ran, score
+    // extracted), then log averages and maxima before resetting.
+    // Accessed exclusively from the single Dispatchers.Default recording
+    // coroutine — same thread-safety contract as the pre-allocated buffers.
+    // No synchronisation is required.
+    private var timingChunksFull = 0
+    private var melAccNs  = 0L;  private var melMaxNs  = 0L
+    private var embAccNs  = 0L;  private var embMaxNs  = 0L
+    private var wakeAccNs = 0L;  private var wakeMaxNs = 0L
+
     init {
         initSessions()
     }
@@ -250,6 +266,23 @@ class NnapiWakeEngine(
     /**
      * Attempt to create an [OrtSession] for [modelBytes] with NNAPI.
      * Returns (session, nnApiSucceeded). If NNAPI throws, retries with CPU.
+     *
+     * Both the NNAPI session and the CPU fallback session are created with
+     * [OrtSession.SessionOptions.setIntraOpNumThreads] and
+     * [OrtSession.SessionOptions.setInterOpNumThreads] set to 1.
+     *
+     * Without these limits, ORT defaults to spawning [Runtime.availableProcessors]
+     * (= 8 on the MT6785) threads for intra-operator parallelism on every inference
+     * call.  At 12.5 inference calls per second across three models the multi-thread
+     * overhead produces the 200 %+ CPU usage observed during screen-off idle.
+     * Limiting each session to one thread keeps all inference work on a single core
+     * and is functionally identical: the 80 ms chunk budget is far wider than the
+     * per-chunk inference time even with serial execution.
+     *
+     * API compatibility: [OrtSession.SessionOptions.setIntraOpNumThreads] and
+     * [OrtSession.SessionOptions.setInterOpNumThreads] have been part of the public
+     * OrtSession.SessionOptions API since ONNX Runtime 1.0 and are confirmed
+     * available in onnxruntime-android 1.18.0.
      */
     private fun tryNnapiSession(modelBytes: ByteArray, label: String): Pair<OrtSession, Boolean> {
         try {
@@ -257,8 +290,11 @@ class NnapiWakeEngine(
             // addNnapi(): confirmed available in onnxruntime-android 1.18.0
             // (inspected via javap on onnxruntime-android-1.18.0.aar/classes.jar)
             opts.addNnapi()
+            // Limit ORT's internal thread pool to one thread.  See kdoc above.
+            opts.setIntraOpNumThreads(1)
+            opts.setInterOpNumThreads(1)
             val sess = env.createSession(modelBytes, opts)
-            Log.i(TAG, "$label: OrtSession created with NNAPI execution provider")
+            Log.i(TAG, "$label: OrtSession created with NNAPI execution provider (intraOp=1, interOp=1)")
             return sess to true
         } catch (e: OrtException) {
             Log.w(TAG, "$label: NNAPI provider rejected (${e.message}) — creating CPU session instead")
@@ -266,9 +302,14 @@ class NnapiWakeEngine(
             Log.w(TAG, "$label: NNAPI session failed (${e.javaClass.simpleName}: ${e.message}) — trying CPU")
         }
 
-        // CPU fallback — must succeed or we rethrow
-        val cpuSess = env.createSession(modelBytes)
-        Log.i(TAG, "$label: OrtSession created with CPU (NNAPI fallback)")
+        // CPU fallback — must succeed or we rethrow.
+        // Thread limits applied here too: this path runs when NNAPI is unavailable
+        // or rejected, so the same multi-thread constraint applies.
+        val cpuOpts = OrtSession.SessionOptions()
+        cpuOpts.setIntraOpNumThreads(1)
+        cpuOpts.setInterOpNumThreads(1)
+        val cpuSess = env.createSession(modelBytes, cpuOpts)
+        Log.i(TAG, "$label: OrtSession created with CPU (NNAPI fallback, intraOp=1, interOp=1)")
         return cpuSess to false
     }
 
@@ -316,34 +357,11 @@ class NnapiWakeEngine(
             // shortBuf is kept as a coroutine-local val following the existing pattern.
             // chunkBuf is the pre-allocated instance field filled from shortBuf each iteration.
             val shortBuf = ShortArray(CHUNK_SAMPLES)
-            var diagChunkCount = 0  // counts every successful read; log every 10th
             Log.i(TAG, "NNAPI engine audio loop started " +
                 "(SAMPLE_RATE=$SAMPLE_RATE, CHUNK=$CHUNK_SAMPLES, MEL_INPUT=${MEL_INPUT_SAMPLES})")
             while (capturing && isActive) {
                 val read = ar.read(shortBuf, 0, CHUNK_SAMPLES)
                 if (read != CHUNK_SAMPLES) continue
-
-                // ── PCM diagnostic: log every 10 chunks (~800 ms) ────────────
-                // Uses the raw ShortArray before any normalization or model processing.
-                // Remove this block once audio capture is confirmed working.
-                diagChunkCount++
-                if (diagChunkCount % 10 == 0) {
-                    var minPcm = Short.MAX_VALUE
-                    var maxPcm = Short.MIN_VALUE
-                    var sumSq  = 0.0
-                    var nonZero = 0
-                    for (s in shortBuf) {
-                        if (s < minPcm) minPcm = s
-                        if (s > maxPcm) maxPcm = s
-                        sumSq += s.toDouble() * s.toDouble()
-                        if (s != 0.toShort()) nonZero++
-                    }
-                    val rms = Math.sqrt(sumSq / CHUNK_SAMPLES).toFloat()
-                    Log.d(TAG, "PCM diag chunk=$diagChunkCount  " +
-                        "read=$read  min=$minPcm  max=$maxPcm  " +
-                        "rms=${"%.1f".format(rms)}  nonZero=$nonZero/${CHUNK_SAMPLES}")
-                }
-                // ─────────────────────────────────────────────────────────────
 
                 // Normalise PCM-16 shorts into the pre-allocated chunkBuf rather than
                 // allocating a new FloatArray(1280) each iteration (saves 5 120 B/chunk).
@@ -406,6 +424,12 @@ class NnapiWakeEngine(
         val emb  = embSess  ?: return
         val wake = wakeSess ?: return
 
+        // Timing locals: set when the respective model.run() succeeds; remain 0
+        // if that stage is not reached (warmup early-returns, exceptions).
+        var localMelNs  = 0L
+        var localEmbNs  = 0L
+        var localWakeNs = 0L
+
         try {
             // ── Stage 1: mel spectrogram ──────────────────────────────────────
             // Build the 1760-sample input in the pre-allocated melInputBuf:
@@ -420,7 +444,9 @@ class NnapiWakeEngine(
             val melIn = OnnxTensor.createTensor(env,
                 FloatBuffer.wrap(melInputBuf),
                 longArrayOf(1L, MEL_INPUT_SAMPLES.toLong()))
+            val t0Mel = System.nanoTime()
             val melRes = mel.run(mapOf(MEL_IN to melIn))
+            localMelNs = System.nanoTime() - t0Mel
             try {
                 val t = melRes.get(0) as OnnxTensor
                 val shape = t.info.shape          // [1, 1, nFrames, 32]
@@ -487,7 +513,9 @@ class NnapiWakeEngine(
             val embIn = OnnxTensor.createTensor(env,
                 FloatBuffer.wrap(embFlatBuf),
                 longArrayOf(1L, MEL_WINDOW.toLong(), MEL_BINS.toLong(), 1L))
+            val t0Emb = System.nanoTime()
             val embRes = emb.run(mapOf(EMB_IN to embIn))
+            localEmbNs = System.nanoTime() - t0Emb
             try {
                 val t = embRes.get(0) as OnnxTensor
                 t.getFloatBuffer().get(embVecBuf)  // reads 96 floats into pre-allocated buffer
@@ -519,7 +547,9 @@ class NnapiWakeEngine(
             val wakeIn = OnnxTensor.createTensor(env,
                 FloatBuffer.wrap(wakeFlatBuf),
                 longArrayOf(1L, EMB_WINDOW.toLong(), EMB_DIM.toLong()))
+            val t0Wake = System.nanoTime()
             val wakeRes = wake.run(mapOf(WAKE_IN to wakeIn))
+            localWakeNs = System.nanoTime() - t0Wake
             try {
                 val t = wakeRes.get(0) as OnnxTensor
                 score = t.getFloatBuffer().get()  // single float at position 0
@@ -532,6 +562,34 @@ class NnapiWakeEngine(
             if (!nnApiConfirmed) {
                 nnApiConfirmed = true
                 Log.i(TAG, "NNAPI engine: first wake score=$score (nnApiEnabled=$nnApiEnabled) — inference confirmed")
+            }
+
+            // ── Inference timing accumulation ─────────────────────────────────────
+            // Placed before onScore() so the sample is recorded regardless of
+            // callback behaviour.  Only reached when all three model.run() calls
+            // succeeded and the score was extracted; warmup early-returns and
+            // inference exceptions never reach this point.
+            melAccNs  += localMelNs;  if (localMelNs  > melMaxNs)  melMaxNs  = localMelNs
+            embAccNs  += localEmbNs;  if (localEmbNs  > embMaxNs)  embMaxNs  = localEmbNs
+            wakeAccNs += localWakeNs; if (localWakeNs > wakeMaxNs) wakeMaxNs = localWakeNs
+            timingChunksFull++
+            if (timingChunksFull >= TIMING_LOG_INTERVAL) {
+                val n = timingChunksFull.toLong()
+                // sumModel avg = mel + emb + wake model.run() durations only.
+                // Excludes tensor creation, array copies, window updates, and
+                // normalisation; not the same as total per-chunk processing time.
+                Log.i(TAG, "inference timing  n=$timingChunksFull  " +
+                    "mel avg=%.2fms max=%.2fms  "
+                        .format(melAccNs  / n / 1_000_000.0, melMaxNs  / 1_000_000.0) +
+                    "emb avg=%.2fms max=%.2fms  "
+                        .format(embAccNs  / n / 1_000_000.0, embMaxNs  / 1_000_000.0) +
+                    "wake avg=%.2fms max=%.2fms  "
+                        .format(wakeAccNs / n / 1_000_000.0, wakeMaxNs / 1_000_000.0) +
+                    "sumModel avg=%.2fms"
+                        .format((melAccNs + embAccNs + wakeAccNs) / n / 1_000_000.0))
+                timingChunksFull = 0
+                melAccNs = 0L; embAccNs = 0L; wakeAccNs = 0L
+                melMaxNs = 0L; embMaxNs = 0L; wakeMaxNs = 0L
             }
 
             onScore(score)
@@ -572,6 +630,11 @@ class NnapiWakeEngine(
                 val nFramesCpu = t.info.shape[2].toInt()
                 val cpuBuf = FloatArray(nFramesCpu * MEL_BINS)
                 t.getFloatBuffer().get(cpuBuf)
+                // Apply the same normalisation that processChunk() applies to the NNAPI output
+                // before passing melOutBuf to this function (processChunk():440  value / 10.0f + 2.0f).
+                // Without this the NNAPI side is in normalised space and the CPU side is raw dB,
+                // producing a spurious ~33–47 divergence and a false "NNAPI mel is likely wrong" warning.
+                for (i in cpuBuf.indices) cpuBuf[i] = cpuBuf[i] / 10.0f + 2.0f
 
                 // Per-output statistics
                 var nnapiMin = Float.MAX_VALUE; var nnapiMax = -Float.MAX_VALUE; var nnapiSum = 0.0
@@ -596,15 +659,22 @@ class NnapiWakeEngine(
                 Log.i(TAG, "  NNAPI mel  frames=${nnapiBuf.size / MEL_BINS}  mean=${"%.3f".format(nnapiMean)}  min=${"%.3f".format(nnapiMin)}  max=${"%.3f".format(nnapiMax)}")
                 Log.i(TAG, "  CPU   mel  frames=${cpuBuf.size  / MEL_BINS}  mean=${"%.3f".format(cpuMean)}  min=${"%.3f".format(cpuMin)}  max=${"%.3f".format(cpuMax)}")
                 Log.i(TAG, "  Diff       maxAbsDiff=${"%.4f".format(maxAbsDiff)}  meanAbsDiff=${"%.6f".format(meanAbsDiff)}")
-                Log.i(TAG, "  Reference  CPU speech mel mean expected ~[-35,-20] dB  silence = -100 dB")
+                Log.i(TAG, "  Reference  normalised speech mel mean expected ~[-1.5, 0.0]  silence ≈ -8.0")
 
+                // Both sides are in normalised mel space (raw_dB / 10 + 2), so the
+                // expected means lie in ≈[-8.0, 0.0] — a total span of ≈8.0.  The
+                // thresholds below are therefore expressed in normalised units, not
+                // decibels: 0.5 normalised == 5 raw dB, 2.0 normalised == 20 raw dB.
+                // (The previous 20f / 5f bounds were raw-dB values left over from
+                // before the CPU output was normalised at line 637; 20f was
+                // unreachable in a space whose full span is only ≈8.0.)
                 when {
-                    Math.abs(nnapiMean - cpuMean) > 20f ->
-                        Log.w(TAG, "  *** LARGE NNAPI/CPU DIVERGENCE (${(nnapiMean - cpuMean).format1()}dB) — NNAPI mel is likely wrong ***")
-                    Math.abs(nnapiMean - cpuMean) > 5f ->
-                        Log.w(TAG, "  *** MODERATE NNAPI/CPU DIVERGENCE (${(nnapiMean - cpuMean).format1()}dB) — investigate further ***")
+                    Math.abs(nnapiMean - cpuMean) > 2f ->
+                        Log.w(TAG, "  *** LARGE NNAPI/CPU DIVERGENCE (${(nnapiMean - cpuMean).format1()} normalised units ≈ ${(nnapiMean - cpuMean).format1dB()} dB) — NNAPI mel is likely wrong ***")
+                    Math.abs(nnapiMean - cpuMean) > 0.5f ->
+                        Log.w(TAG, "  *** MODERATE NNAPI/CPU DIVERGENCE (${(nnapiMean - cpuMean).format1()} normalised units ≈ ${(nnapiMean - cpuMean).format1dB()} dB) — investigate further ***")
                     else ->
-                        Log.i(TAG, "  NNAPI and CPU mel outputs are consistent (mean diff ${(nnapiMean - cpuMean).format1()}dB < 5 dB)")
+                        Log.i(TAG, "  NNAPI and CPU mel outputs are consistent (mean diff ${(nnapiMean - cpuMean).format1()} normalised units ≈ ${(nnapiMean - cpuMean).format1dB()} dB, threshold 0.5)")
                 }
             } finally {
                 cpuRes.close()
@@ -621,6 +691,13 @@ class NnapiWakeEngine(
     }
 
     private fun Float.format1() = "%.1f".format(this)
+
+    /**
+     * Convert a divergence expressed in normalised mel units back to raw dB for
+     * human-readable log output.  Inverse of the `value / 10.0f + 2.0f` transform:
+     * the constant offset cancels in a difference, so `dB = normalised * 10`.
+     */
+    private fun Float.format1dB() = "%.1f".format(this * 10.0f)
 
     private fun hasMicPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==

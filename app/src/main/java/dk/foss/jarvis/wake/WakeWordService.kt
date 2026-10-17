@@ -18,9 +18,11 @@ import androidx.core.app.ServiceCompat
 import com.rementia.openwakeword.lib.WakeWordEngine
 import com.rementia.openwakeword.lib.model.DetectionMode
 import com.rementia.openwakeword.lib.model.WakeWordModel
+import android.provider.Settings
 import dk.foss.jarvis.BuildConfig
 import dk.foss.jarvis.MainActivity
 import dk.foss.jarvis.R
+import dk.foss.jarvis.assist.JarvisInteractionService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -79,6 +81,12 @@ class WakeWordService : Service() {
     private var burstPeak = 0f
     private var inBurst = false
     private var frameCount = 0
+
+    // Consecutive frames at or above STRONG_THRESHOLD; reset when score drops below
+    // the threshold, when the engine pauses, or when a trigger fires.
+    // Prevents a single brief spike from background audio from satisfying the
+    // strong-frame path — requires MIN_CONSECUTIVE_STRONG frames in a row.
+    private var consecutiveStrong = 0
 
     // Callback for VoiceInteractionService — set when started via startWithListener()
     private var wakeListener: WakeListener? = null
@@ -200,15 +208,36 @@ class WakeWordService : Service() {
         // Skip detection logic if paused or cooling
         if (paused || cooling) return
 
+        // Track consecutive frames at or above STRONG_THRESHOLD.
+        // Reset when score falls below the threshold so only unbroken runs count.
+        if (score >= STRONG_THRESHOLD) consecutiveStrong++ else consecutiveStrong = 0
+
         recentScores.addLast(score)
         while (recentScores.size > SMOOTHING_FRAMES) recentScores.removeFirst()
         val sustained = recentScores.size == SMOOTHING_FRAMES &&
             recentScores.sum() / SMOOTHING_FRAMES >= SUSTAINED_THRESHOLD
-        if (score < STRONG_THRESHOLD && !sustained) return
+        // Strong path now requires MIN_CONSECUTIVE_STRONG frames in a row at or above
+        // STRONG_THRESHOLD; a single spike no longer fires by itself.
+        // Sustained path is unchanged: mean ≥ SUSTAINED_THRESHOLD over SMOOTHING_FRAMES.
+        if (consecutiveStrong < MIN_CONSECUTIVE_STRONG && !sustained) return
 
         val now = SystemClock.elapsedRealtime()
         if (now - lastTriggerAt < REFRACTORY_MS) return
         lastTriggerAt = now
+
+        // Diagnostic log — fires once per accepted trigger; reads window before clearing.
+        val triggerPath = when {
+            consecutiveStrong >= MIN_CONSECUTIVE_STRONG && sustained ->
+                "strong($consecutiveStrong)+sustained"
+            consecutiveStrong >= MIN_CONSECUTIVE_STRONG ->
+                "strong($consecutiveStrong)"
+            else ->
+                "sustained"  // consecutiveStrong < MIN_CONSECUTIVE_STRONG; sustained was true
+        }
+        val winMean = if (recentScores.isNotEmpty()) recentScores.sum() / recentScores.size else 0f
+        Log.i(TAG, "WAKE trigger: path=$triggerPath  score=%.3f  winMean=%.3f  winSize=${recentScores.size}".format(score, winMean))
+
+        consecutiveStrong = 0
         recentScores.clear()
         onWake(score)
     }
@@ -221,14 +250,34 @@ class WakeWordService : Service() {
         // Free the mic so conversation mode's recognizer can record
         pauseEngine()
 
-        // Notify the VoiceInteractionService listener if present (new architecture)
-        // Otherwise fall back to legacy direct launch (for backwards compat)
-        wakeListener?.let {
-            Log.i(TAG, "Notifying VoiceInteractionService listener")
-            it.onWakeDetected()
-        } ?: run {
-            Log.i(TAG, "No VoiceInteractionService listener — legacy direct launch")
-            legacyLaunch()
+        // Three wake paths, tried in priority order:
+        //
+        // 1. wakeListener (preferred) — wired by JarvisInteractionService.startWithListener().
+        //    Fires showSession() via the WakeListener callback.  Available when the service
+        //    was started by the VIS's onReady() path.
+        //
+        // 2. JarvisInteractionService.triggerWakeSession() (secondary VIS path) — used when
+        //    wakeListener is null but the VIS instance is still alive.  Happens when the
+        //    service was started by BootReceiver in legacy mode before onReady() called
+        //    startWithListener().  showSession() → startAssistantActivity() is exempt from
+        //    Android background-activity-launch (BAL) restrictions.
+        //
+        // 3. legacyLaunch() — Jarvis is not the active VoiceInteractionService.  Falls back
+        //    to a CATEGORY_CALL full-screen-intent notification which works on all screen
+        //    states without needing BAL exemptions.
+        when {
+            wakeListener != null -> {
+                Log.i(TAG, "Wake path 1: VIS wakeListener → showSession()")
+                wakeListener!!.onWakeDetected()
+            }
+            JarvisInteractionService.triggerWakeSession() -> {
+                // triggerWakeSession() already logged "showSession() dispatched" on success.
+                Log.i(TAG, "Wake path 2: VIS static trigger → showSession() dispatched")
+            }
+            else -> {
+                Log.i(TAG, "Wake path 3: legacy (VIS not active) → notifyWake")
+                legacyLaunch()
+            }
         }
 
         uiScope.launch {
@@ -243,10 +292,41 @@ class WakeWordService : Service() {
             putExtra(MainActivity.EXTRA_FROM_ASSIST, true)
         }
         val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-        if (km?.isKeyguardLocked == true) {
-            notifyWake(launch)
-        } else {
-            runCatching { startActivity(launch) }
+        val locked = km?.isKeyguardLocked == true
+        // SYSTEM_ALERT_WINDOW grants a BAL exemption on Android 10+ when the permission
+        // is actually approved by the user (Settings → Apps → Jarvis → "Display over other apps").
+        val canDrawOverlays = Settings.canDrawOverlays(this)
+
+        when {
+            canDrawOverlays -> {
+                // Permission granted → startActivity() is BAL-exempt; direct launch works.
+                Log.i(TAG, "legacyLaunch: canDrawOverlays=true → startActivity (BAL exempt)")
+                runCatching { startActivity(launch) }.onFailure { e ->
+                    // Unexpected: permission is granted but launch still failed (e.g. ActivityNotFoundException).
+                    // Fall through to the notification so the user still sees feedback.
+                    Log.w(TAG, "legacyLaunch: startActivity failed despite canDrawOverlays (${e.javaClass.simpleName}: ${e.message}) — notifyWake fallback")
+                    notifyWake(launch)
+                }
+            }
+            locked -> {
+                // Screen locked → CATEGORY_CALL full-screen intent turns the screen on
+                // and launches the activity via the PendingIntent.
+                Log.i(TAG, "legacyLaunch: screen locked, canDrawOverlays=false → notifyWake (full-screen intent)")
+                notifyWake(launch)
+            }
+            else -> {
+                // Unlocked home screen, no SYSTEM_ALERT_WINDOW.
+                // startActivity() from a background foreground-service is silently blocked
+                // by Android 10+ BAL restrictions when SYSTEM_ALERT_WINDOW is not granted.
+                // Send a CATEGORY_CALL notification the user can tap to open Jarvis.
+                // For fully seamless (no-tap) launch:
+                //   • Set Jarvis as the default assistant (recommended — uses startAssistantActivity()), or
+                //   • Grant "Display over other apps" in Settings → Apps → Jarvis.
+                Log.w(TAG, "legacyLaunch: unlocked home screen, canDrawOverlays=false — " +
+                    "startActivity() blocked by Android BAL; sending tap-to-open notification. " +
+                    "For seamless launch: set Jarvis as default assistant or grant 'Display over other apps'.")
+                notifyWake(launch)
+            }
         }
     }
 
@@ -302,6 +382,7 @@ class WakeWordService : Service() {
         runCatching { engine?.stop() }       // library engine pause
         runCatching { nnapiEngine?.stop() }  // NNAPI engine pause
         recentScores.clear()
+        consecutiveStrong = 0
         inBurst = false
         burstPeak = 0f
         Log.i(TAG, "wake paused (mic released)")
@@ -350,6 +431,11 @@ class WakeWordService : Service() {
         private const val REFRACTORY_MS = 2500L // ignore re-triggers right after a fire
         private const val BURST_FLOOR = 0.1f // score above which a "voice burst" is in progress
         private const val COOLDOWN_MS = 1500L // engine `detections` cooldown (unused now, harmless)
+        // Minimum consecutive frames at or above STRONG_THRESHOLD required for the
+        // strong-frame path to fire.  2 frames = 160 ms of sustained elevated score.
+        // The sustained-average path (mean ≥ SUSTAINED_THRESHOLD over SMOOTHING_FRAMES)
+        // is unchanged and unaffected by this counter.
+        private const val MIN_CONSECUTIVE_STRONG = 2
 
         @Volatile private var instance: WakeWordService? = null
 

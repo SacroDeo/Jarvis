@@ -30,10 +30,14 @@ class JarvisInteractionService : VoiceInteractionService() {
     override fun onReady() {
         super.onReady()
         Log.i(TAG, "onReady — Jarvis is the active VoiceInteractionService, starting wake word listener")
+        // Expose this instance so WakeWordService can call showSession() directly when its
+        // per-service wakeListener has not been wired (e.g., service restarted via BootReceiver
+        // before startWithListener() was called).  Cleared in onShutdown().
+        instance = this
 
         wakeListener = object : WakeListener {
             override fun onWakeDetected() {
-                Log.i(TAG, "Wake detected via VoiceInteractionService callback → showSession()")
+                Log.i(TAG, "Wake detected via VoiceInteractionService wakeListener → showSession()")
                 showSession(null, 0)
             }
         }
@@ -47,6 +51,7 @@ class JarvisInteractionService : VoiceInteractionService() {
     override fun onShutdown() {
         super.onShutdown()
         Log.i(TAG, "onShutdown — stopping wake word listener")
+        instance = null
         if (wakeListener != null) {
             WakeWordService.stop(this)
             wakeListener = null
@@ -61,6 +66,43 @@ class JarvisInteractionService : VoiceInteractionService() {
 
     companion object {
         private const val TAG = "JarvisAssist"
+
+        /**
+         * Set to the live service instance in [onReady] (when confirmed as the active VIS)
+         * and cleared in [onShutdown].  Allows [WakeWordService] to call [showSession] via
+         * [triggerWakeSession] even when the per-service [wakeListener] has not been wired
+         * — for example when the service was started by BootReceiver in legacy mode before
+         * [onReady] had a chance to call [startWithListener].
+         *
+         * Volatile because [WakeWordService.onScore] runs on the main thread and [onReady]/
+         * [onShutdown] also run on the main thread, but the @Volatile annotation makes the
+         * field's writes visible across threads without additional synchronisation.
+         */
+        @Volatile private var instance: JarvisInteractionService? = null
+
+        /**
+         * Attempt to trigger a voice session via the live [VoiceInteractionService] instance.
+         *
+         * Returns true if [showSession] was dispatched (VIS was alive and active), false
+         * if the VIS instance is not available.  Called by [WakeWordService] as a secondary
+         * VIS path when [WakeWordService.wakeListener] is null.
+         *
+         * Must be called from the main thread (same constraint as [showSession] itself).
+         */
+        fun triggerWakeSession(): Boolean {
+            val svc = instance ?: run {
+                Log.d(TAG, "triggerWakeSession: no active VIS instance — VIS not running or not default assistant")
+                return false
+            }
+            return try {
+                svc.showSession(null, 0)
+                Log.i(TAG, "triggerWakeSession: showSession() dispatched via static VIS instance")
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "triggerWakeSession: showSession() failed — ${e.message}")
+                false
+            }
+        }
 
         /**
          * Returns true if OUR VoiceInteractionService is the one currently selected

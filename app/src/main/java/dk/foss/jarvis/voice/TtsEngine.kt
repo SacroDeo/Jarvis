@@ -68,9 +68,19 @@ class AndroidTts(
                     selectedVoice = findSystemVoice(toApply)
                     selectedVoice?.let { runCatching { tts.setVoice(it) } }
                     voiceToApply = null
-                } else if (selectedVoice == null && !languageTag.isNullOrEmpty()) {
-                    // No specific voice — fall back to language tag.
-                    runCatching { tts.language = Locale.forLanguageTag(languageTag) }
+                } else {
+                    // No explicit voice provided — auto-select the best male English voice
+                    // available on this device.  This runs every time AndroidTts is
+                    // constructed without a saved voice (e.g. first launch, or fallback
+                    // instance), so the device default (which is often female) is never
+                    // silently used.  Falls back through non-female → any English →
+                    // language tag if the device carries no recognisably-male voice.
+                    selectedVoice = pickMaleVoiceFromSystem()
+                    if (selectedVoice != null) {
+                        runCatching { tts.setVoice(selectedVoice!!) }
+                    } else if (!languageTag.isNullOrEmpty()) {
+                        runCatching { tts.language = Locale.forLanguageTag(languageTag) }
+                    }
                 }
             }
             val p = pending; pending = null
@@ -79,6 +89,44 @@ class AndroidTts(
                 else p.third("TTS unavailable")
             }
         }
+    }
+
+    /**
+     * Inspect [tts.voices] (available only inside the TTS init callback once the
+     * engine is ready) and return the best male-sounding English
+     * [android.speech.tts.Voice] installed on this device.
+     *
+     * Builds a minimal [TtsVoice] representation from the platform voice list and
+     * delegates to [selectBestMaleEnglishVoice] for ranking (en-IN > en-US > en-GB >
+     * any English; local/on-device preferred over network; quality as tiebreaker).
+     *
+     * Falls back through non-female (unknown-gender) voices, then any English voice,
+     * before giving up.  Returns null only when the device has no English voices at
+     * all — in that case the caller can still apply a [languageTag] hint.
+     */
+    private fun pickMaleVoiceFromSystem(): Voice? {
+        val systemVoices = try { tts.voices ?: return null } catch (e: Exception) { return null }
+        val ttsVoices = systemVoices.mapNotNull { v ->
+            try {
+                val nameLower = v.name.lowercase()
+                val features  = try { v.features ?: emptySet<String>() } catch (_: Exception) { emptySet<String>() }
+                val featLower  = features.map { it.lowercase() }.toSet()
+                val gender = when {
+                    nameLower.contains("female") || featLower.any { it.contains("female") } -> "female"
+                    nameLower.contains("male")   || featLower.any { it.contains("male")   } -> "male"
+                    else -> "unknown"
+                }
+                TtsVoice(
+                    id      = v.name,
+                    name    = v.name,
+                    locale  = v.locale.toLanguageTag(),
+                    gender  = gender,
+                    quality = v.quality,
+                )
+            } catch (_: Exception) { null }
+        }
+        val best = selectBestMaleEnglishVoice(ttsVoices) ?: return null
+        return systemVoices.firstOrNull { it.name == best.id }
     }
 
     /**

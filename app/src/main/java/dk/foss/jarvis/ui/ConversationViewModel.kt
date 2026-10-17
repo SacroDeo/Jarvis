@@ -242,7 +242,13 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                     main.postDelayed({ if (turn == myTurn) startRecognition() }, 450)
                     return@onMain
                 }
-                hint.value = message
+                // Don't show a hint on wake-triggered turns when no speech was heard.
+                // The user didn't consciously start a turn, so "Didn't catch that /
+                // Tap the mic to talk" is confusing noise.  goIdle() re-arms the wake
+                // listener so the user can simply say the wake phrase again.
+                // On tap-initiated turns, show the hint so the user knows the mic was
+                // active but nothing was recognised.
+                if (!currentTurnFromWake) hint.value = message
                 goIdle()
             }
         })
@@ -430,7 +436,12 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         speaking = true
         speakingIndex.value = spokenCount
         spokenCount++
-        if (state.value != ConvState.Speaking) state.value = ConvState.Speaking
+        if (state.value != ConvState.Speaking) {
+            state.value = ConvState.Speaking
+            // Start a concurrent interrupt listener so the user can say a silence or exit
+            // phrase — or new input — without tapping first.  See watchForInterrupt().
+            watchForInterrupt()
+        }
         val engine = tts ?: ensureFallback()
         if (engine == null) { speaking = false; return }
         val myTurn = turn
@@ -453,6 +464,50 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /**
+     * Starts a concurrent recognition session as soon as TTS begins, so the user
+     * can interrupt Jarvis mid-speech by voice — without tapping first.
+     *
+     * **Why only [SpeechInput]?**
+     * [SpeechInput] uses Android's [android.speech.SpeechRecognizer], which enables
+     * hardware acoustic echo cancellation (AEC).  AEC suppresses the TTS speaker output
+     * before the mic signal reaches the recognizer, so Jarvis does not accidentally
+     * "hear" its own speech.
+     *
+     * [ScribeRecognizer] captures raw PCM via [AudioCapture] with no AEC.  TTS audio
+     * would leak into the recording, be sent to ElevenLabs Scribe, and return a
+     * garbled transcription that could be misinterpreted as a new user request.  On
+     * the ElevenLabs path the existing tap-to-interrupt path (onMicTap → beginTurn
+     * stops TTS immediately) is sufficient.
+     *
+     * **Turn safety:** [myTurn] is captured at call time.  [beginTurn] always increments
+     * [turn] before touching the recognizer, so any pending [onFinal] callback from a
+     * stale barge-in session is a guaranteed no-op ([turn] ≠ [myTurn]).
+     */
+    private fun watchForInterrupt() {
+        if (recognizer !is SpeechInput) return  // AEC guard — see kdoc
+        val myTurn = turn
+        recognizer?.start(languageTag = null, listener = object : VoiceRecognizer.Listener {
+            override fun onFinal(text: String) = onMain {
+                if (turn != myTurn) return@onMain  // turn already advanced — stale callback
+                when {
+                    text.isBlank()         -> {}              // no speech / timeout — TTS continues normally
+                    isSilenceCommand(text) -> handleSilenceCommand()
+                    isExitCommand(text)    -> handleExitCommand()
+                    else -> {
+                        // User spoke new input while Jarvis was talking — barge in.
+                        beginTurn()            // stops TTS and clears queued sentences
+                        transcript.value = text
+                        think(text)
+                    }
+                }
+            }
+            // Recognition errors during TTS (NO_MATCH, SPEECH_TIMEOUT, AUDIO, etc.) are
+            // expected — the user may simply not have spoken.  Silently ignore; the normal
+            // finishTurn → startListening path handles the next listen window.
+        })
+    }
+
     private fun finishTurn() {
         if (continuous) startListening() else goIdle()
     }
@@ -472,6 +527,19 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
      * root cause of the "must press mic button" regression.
      */
     private fun goIdle() {
+        // Stop any recognition still in flight before re-arming the wake word.
+        // Two reasons, both specific to the barge-in session watchForInterrupt() opens
+        // during Speaking:
+        //  1. A late onFinal from that session would otherwise pass its `turn == myTurn`
+        //     guard — goIdle() does not bump turn — and open an unintended new turn.
+        //  2. It must release the mic BEFORE rearmWake fires WAKE_REARM_DELAY_MS later,
+        //     otherwise the wake engine and SpeechRecognizer contend for RECORD_AUDIO.
+        //     A failed AudioRecord init leaves paused=false, so isHealthy() would report
+        //     healthy while neither engine is actually capturing.
+        // Safe at every goIdle() call site: the session has already delivered a result
+        // or an error, so this is a cancel on a finished or absent recognizer.  It also
+        // fires on the Scribe path, whose stop() is likewise an idempotent cancel.
+        runCatching { recognizer?.stop() }
         state.value = ConvState.Idle
         main.removeCallbacks(rearmWake)
         // Track consecutive wake-triggered empty turns (diagnostic only).
