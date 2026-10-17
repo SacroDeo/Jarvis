@@ -3,6 +3,7 @@ package dk.foss.jarvis.ui
 import android.app.Application
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -91,6 +92,46 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     // If content pauses while the stream is still open, the agent is likely running a tool.
     private val stallIndicator = Runnable { if (working.value) stalled.value = true }
 
+    // ── automatic exit after silence ────────────────────────────────────────────
+    private val TAG = "JarvisConv"
+
+    /**
+     * Fired when the turn is over and no user speech has arrived within
+     * [CONVERSATION_SILENCE_TIMEOUT_MS].
+     *
+     * Routes through [handleExitCommand] so automatic exit, saying "goodbye", and the
+     * close button all share one teardown path:
+     * stopAll() → exitRequested → ConversationScreen.onExit() → moveTaskToBack(true).
+     * stopAll() releases the recognizer and calls WakeWordService.resumeListening(),
+     * so the app is never force-closed and wake-word detection stays available.
+     *
+     * Only ever armed from [goIdle] and [handleSilenceCommand], both of which run
+     * strictly after JARVIS has stopped speaking and no request is in flight — so this
+     * can never fire during Listening, Thinking, or Speaking.
+     */
+    private val silenceExit = Runnable {
+        cancelSilenceExit()
+        Log.i(TAG, "auto-exit — no speech for ${CONVERSATION_SILENCE_TIMEOUT_MS}ms")
+        handleExitCommand()
+    }
+
+    /**
+     * Recover-only watchdog for a recognizer that never delivers either a result or an
+     * error (which would otherwise leave the conversation stuck in Listening forever,
+     * because [goIdle] — and therefore the silence timer — is never reached).
+     *
+     * Re-armed by every speech signal ([VoiceRecognizer.Listener.onSpeechStart] and
+     * [VoiceRecognizer.Listener.onPartial]), so a user speaking continuously keeps
+     * resetting it and is never cut off. It only fires when the recognizer is genuinely
+     * silent for the full window.
+     */
+    private val listeningWatchdog = Runnable {
+        if (state.value != ConvState.Listening) return@Runnable
+        cancelListeningWatchdog()
+        Log.w(TAG, "no recognizer result or error for ${MAX_LISTENING_MS}ms while Listening — forcing idle")
+        goIdle()
+    }
+
     init {
         viewModelScope.launch { ensureReady() }
     }
@@ -129,6 +170,11 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         continuous = true
         retriedThisTurn = false
         currentTurnFromWake = fromWake
+        // A new turn is starting — either from a wake event or a tap — so any pending
+        // auto-exit must be cancelled, otherwise saying "Hey Jarvis" during the silence
+        // window could immediately exit the conversation it just opened.
+        cancelSilenceExit()
+        armListeningWatchdog()
         // Free the mic from the always-on wake listener so STT can record, and cancel
         // any pending re-arm so the wake engine doesn't grab the mic mid-capture.
         main.removeCallbacks(rearmWake)
@@ -193,6 +239,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     fun resetView() {
         turn++ // invalidate any in-flight callbacks from a prior screen visit
         main.removeCallbacks(rearmWake)
+        cancelSilenceExit()
+        cancelListeningWatchdog()
         emptyWakeTurns = 0
         currentTurnFromWake = false
         runCatching { recognizer?.stop() }
@@ -214,7 +262,17 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private fun startRecognition() {
         val myTurn = turn
         recognizer?.start(languageTag = null, listener = object : VoiceRecognizer.Listener {
+            override fun onSpeechStart() = onMain {
+                // The user has begun speaking. Refresh the stuck-recognizer watchdog so
+                // long utterances are never cut off, and cancel any pending auto-exit.
+                cancelSilenceExit()
+                armListeningWatchdog()
+            }
+
             override fun onPartial(text: String) = onMain {
+                // Live speech is arriving (SpeechInput only) — same as onSpeechStart.
+                cancelSilenceExit()
+                armListeningWatchdog()
                 if (turn == myTurn) transcript.value = text
             }
 
@@ -225,6 +283,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
             override fun onFinal(text: String) = onMain {
                 if (turn != myTurn) return@onMain
+                cancelListeningWatchdog()
                 transcript.value = text
                 when {
                     text.isBlank()         -> goIdle()
@@ -236,6 +295,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
             override fun onError(message: String, transient: Boolean) = onMain {
                 if (turn != myTurn) return@onMain
+                cancelListeningWatchdog()
                 // Cold-start / mic-handoff hiccup right after a wake — retry once.
                 if (transient && !retriedThisTurn) {
                     retriedThisTurn = true
@@ -302,6 +362,9 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         hint.value = null
         // Re-arm the wake word so the user can say "Hey Jarvis" to re-engage.
         main.postDelayed(rearmWake, WAKE_REARM_DELAY_MS)
+        // Also start the silence countdown: "shut up" leaves the conversation idle, so
+        // it must auto-exit too rather than wait forever for a tap.
+        armSilenceExit()
     }
 
     /**
@@ -320,6 +383,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private fun think(userText: String) {
         val myTurn = turn
         emptyWakeTurns = 0 // got real speech — reset the wake loop-breaker
+        // No longer listening: the stuck-recognizer watchdog no longer applies.
+        cancelListeningWatchdog()
         hint.value = null
         // Pipeline state was already cleared by beginTurn(); only the stream-status
         // flags are new for this thinking phase.
@@ -438,6 +503,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         spokenCount++
         if (state.value != ConvState.Speaking) {
             state.value = ConvState.Speaking
+            // Jarvis is talking, so the listening watchdog and any pending auto-exit
+            // are both irrelevant until this turn finishes.
+            cancelListeningWatchdog()
+            cancelSilenceExit()
             // Start a concurrent interrupt listener so the user can say a silence or exit
             // phrase — or new input — without tapping first.  See watchForInterrupt().
             watchForInterrupt()
@@ -512,6 +581,26 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         if (continuous) startListening() else goIdle()
     }
 
+    /** Arm (or re-arm) the automatic-exit timer. */
+    private fun armSilenceExit() {
+        main.removeCallbacks(silenceExit)
+        main.postDelayed(silenceExit, CONVERSATION_SILENCE_TIMEOUT_MS)
+    }
+
+    private fun cancelSilenceExit() {
+        main.removeCallbacks(silenceExit)
+    }
+
+    /** Arm (or re-arm) the stuck-recognizer watchdog. Reset by every speech signal. */
+    private fun armListeningWatchdog() {
+        main.removeCallbacks(listeningWatchdog)
+        main.postDelayed(listeningWatchdog, MAX_LISTENING_MS)
+    }
+
+    private fun cancelListeningWatchdog() {
+        main.removeCallbacks(listeningWatchdog)
+    }
+
     /**
      * Go idle WITHIN the conversation. Re-arms the wake word after a short settle
      * delay (WAKE_REARM_DELAY_MS) so the NNAPI/VoiceInteractionService engine can
@@ -540,12 +629,18 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         // or an error, so this is a cancel on a finished or absent recognizer.  It also
         // fires on the Scribe path, whose stop() is likewise an idempotent cancel.
         runCatching { recognizer?.stop() }
+        cancelListeningWatchdog()
         state.value = ConvState.Idle
         main.removeCallbacks(rearmWake)
         // Track consecutive wake-triggered empty turns (diagnostic only).
         if (currentTurnFromWake) emptyWakeTurns++ else emptyWakeTurns = 0
         // Always re-arm after the settle delay — never suppress permanently.
         main.postDelayed(rearmWake, WAKE_REARM_DELAY_MS)
+        // The turn is over and Jarvis is no longer speaking, so it is now safe to
+        // start counting silence. Cancelled again by any speech onset or wake event.
+        // Skipped while an error is showing: Retry/Dismiss must stay available and the
+        // banner must never auto-dismiss itself.
+        if (error.value == null) armSilenceExit() else cancelSilenceExit()
     }
 
     private fun ensureFallback(): TtsEngine? {
@@ -568,6 +663,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
         main.removeCallbacks(rearmWake)
+        cancelSilenceExit()
+        cancelListeningWatchdog()
         working.value = false
         stalled.value = false
         recognizer?.release()
@@ -595,6 +692,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
         main.removeCallbacks(rearmWake)
+        cancelSilenceExit()
+        cancelListeningWatchdog()
         recognizer?.release()
         cancelRunnable?.run()
         cancelRunnable = null
@@ -609,6 +708,35 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         const val IDLE_FLUSH_MS = 350L
         const val STALL_MS = 800L
         const val WAKE_REARM_DELAY_MS = 1200L
+
+        // ── automatic exit after silence ───────────────────────────────────────
+        // THE single place this timeout is defined.
+        /**
+         * How long the conversation stays open after Jarvis has finished speaking (or
+         * finished listening) without any further user speech.  On expiry the VM runs
+         * the same teardown as saying "goodbye": stopAll() + exitRequested, which
+         * releases the recognizer, hands the mic back to WakeWordService and moves the
+         * activity to the background.  The app is not killed and wake-word detection
+         * stays enabled, so "Hey Jarvis" works immediately afterwards.
+         */
+        const val CONVERSATION_SILENCE_TIMEOUT_MS = 20_000L
+
+        /**
+         * Recover-only ceiling on a single listening window.  If the recognizer
+         * produces neither a result nor an error for this long while the VM is in
+         * [ConvState.Listening], the watchdog forces idle so the conversation cannot get
+         * stuck forever (and so [CONVERSATION_SILENCE_TIMEOUT_MS] can finally arm).
+         *
+         * Deliberately conservative at 45 s: it is well above the longest legitimate
+         * path through either backend — AudioCapture caps one utterance at MAX_MS = 30 s
+         * plus END_SILENCE_MS = 1.8 s plus transcription/upload time, and SpeechInput
+         * relies on the platform speech timeout.  Crucially the watchdog is re-armed by
+         * onSpeechStart and onPartial, so a user who is still talking resets it and is
+         * never cut off; it can only fire while the recognizer is truly mute.  It also
+         * cannot fire outside [ConvState.Listening], so it can never interrupt Jarvis
+         * mid-sentence or abandon an in-flight request.
+         */
+        const val MAX_LISTENING_MS = 45_000L
 
         /**
          * Utterances that mean "stop speaking right now" — handled locally, never sent to LLM.

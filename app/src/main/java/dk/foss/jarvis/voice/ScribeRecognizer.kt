@@ -29,7 +29,10 @@ class ScribeRecognizer(
         capture.cancel() // ensure no prior capture blocks this one (active-guard)
         listener.onReady()
         capture.start(
-            onSpeechStart = {},
+            // Forward the onset AudioCapture already detects: this backend has no live
+            // partials, so without this the VM cannot tell that the user started
+            // speaking until transcription finishes seconds later.
+            onSpeechStart = { listener.onSpeechStart() },
             onResult = { file ->
                 listener.onEnd()
                 if (file == null) {
