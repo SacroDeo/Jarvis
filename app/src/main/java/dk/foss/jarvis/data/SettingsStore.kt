@@ -25,7 +25,10 @@ data class JarvisSettings(
     val elevenKey: String,
     val elevenVoiceId: String,
     val wakeEnabled: Boolean,
-    val ttsVoiceId: String? = null,
+    // JSON TtsVoice chosen explicitly by the user inside JARVIS.  Null means "no
+    // in-app choice" — AndroidTts then leaves the engine alone so the phone's
+    // system Text-to-speech voice is used.
+    val ttsVoiceUserId: String? = null,
     val speakerVerificationEnabled: Boolean = false,
 ) {
     val isConfigured: Boolean get() = workerUrl.isNotEmpty() && workerToken.isNotEmpty()
@@ -42,6 +45,10 @@ class SettingsStore(private val context: Context) {
         val ELEVEN_VOICE = stringPreferencesKey("eleven_voice")
         val WAKE_ENABLED = booleanPreferencesKey("wake_enabled")
         val TTS_VOICE_ID = stringPreferencesKey("tts_voice_id")
+        // Legacy key: it was also written by an automatic "best male English" pick, so a
+        // value there cannot be told apart from a deliberate user choice.  Only ever
+        // removed now (see migrateLegacyTtsVoice), never read.
+        val TTS_VOICE_USER = stringPreferencesKey("tts_voice_user")
         val SPEAKER_VERIFICATION_ENABLED = booleanPreferencesKey("speaker_verification_enabled")
     }
 
@@ -54,7 +61,7 @@ class SettingsStore(private val context: Context) {
             elevenVoiceId = (p[Keys.ELEVEN_VOICE] ?: "")
                 .ifEmpty { BuildConfig.DEFAULT_ELEVEN_VOICE.ifEmpty { DEFAULT_ELEVEN_VOICE } },
             wakeEnabled = p[Keys.WAKE_ENABLED] ?: false,
-            ttsVoiceId = p[Keys.TTS_VOICE_ID],
+            ttsVoiceUserId = p[Keys.TTS_VOICE_USER],
             speakerVerificationEnabled = p[Keys.SPEAKER_VERIFICATION_ENABLED] ?: false,
         )
     }
@@ -78,14 +85,36 @@ class SettingsStore(private val context: Context) {
         }
     }
 
+    /**
+     * Record (or clear) the voice the user explicitly picked in the JARVIS voice list.
+     *
+     * Only called from an explicit user action.  Writing also drops the legacy
+     * `tts_voice_id` key, whose value may have come from the old automatic
+     * "best male English" selection and would otherwise keep overriding the
+     * phone's system Text-to-speech voice.  No other setting is touched.
+     */
     suspend fun updateTtsVoice(voice: TtsVoice?) {
         context.dataStore.edit { p ->
             val value = voice?.let { json.encodeToString(TtsVoice.serializer(), it) }
             if (value != null) {
-                p[Keys.TTS_VOICE_ID] = value
+                p[Keys.TTS_VOICE_USER] = value
             } else {
-                p[Keys.TTS_VOICE_ID] = ""
+                p.remove(Keys.TTS_VOICE_USER)
             }
+            p.remove(Keys.TTS_VOICE_ID)
+        }
+    }
+
+    /**
+     * One-time cleanup of the legacy auto-populated voice preference, so it stops
+     * overriding the phone's system Text-to-speech voice.  Safe to call on every
+     * settings save: it is a no-op once the legacy key is gone, it never writes a
+     * value, and it touches no other key.  Deliberate in-app choices live in the
+     * separate `tts_voice_user` key and are left alone.
+     */
+    suspend fun migrateLegacyTtsVoice() {
+        context.dataStore.edit { p ->
+            if (p.contains(Keys.TTS_VOICE_ID)) p.remove(Keys.TTS_VOICE_ID)
         }
     }
 

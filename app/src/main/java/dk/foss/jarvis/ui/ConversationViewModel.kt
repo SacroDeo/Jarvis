@@ -142,7 +142,12 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             tts = if (s.useElevenLabs) {
                 ElevenLabsTts(getApplication(), s.elevenKey, s.elevenVoiceId)
             } else {
-                val voice = s.ttsVoiceId?.let { Json { ignoreUnknownKeys = true }.decodeFromString(TtsVoice.serializer(), it) }
+                // Only an explicit in-app choice is honoured.  A missing, blank, or corrupted
+                // pref degrades to the engine's system-configured voice — never throw
+                // and kill ensureReady().
+                val voice = s.ttsVoiceUserId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { runCatching { Json { ignoreUnknownKeys = true }.decodeFromString(TtsVoice.serializer(), it) }.getOrNull() }
                 val androidTts = AndroidTts(getApplication(), languageTag = null, voice = voice)
                 // applyVoiceIfNeeded() handles the case where TTS initialised synchronously
                 // (rare). The real work is done inside the TTS init callback, which picks up

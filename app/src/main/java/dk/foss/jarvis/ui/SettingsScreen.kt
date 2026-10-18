@@ -228,6 +228,9 @@ fun SettingsScreen(onBack: () -> Unit) {
     suspend fun persist() {
         store.updateWorkerConnection(workerUrl, workerToken, model)
         store.updateVoice(elevenKey, elevenVoice)
+        // Drop any legacy auto-populated voice so it can't override the phone's
+        // system Text-to-speech voice, then persist an explicit choice if there is one.
+        store.migrateLegacyTtsVoice()
         if (selectedTtsVoice != null) {
             store.updateTtsVoice(selectedTtsVoice)
         }
@@ -241,14 +244,9 @@ fun SettingsScreen(onBack: () -> Unit) {
             try {
                 val voices = AndroidTts.getAvailableVoices(context)
                 ttsVoices = voices
-                // Auto-select best male English voice if none selected
-                if (selectedTtsVoice == null) {
-                    val best = AndroidTts.selectBestMaleEnglishVoice(voices)
-                    if (best != null) {
-                        selectedTtsVoice = best
-                        store.updateTtsVoice(best)
-                    }
-                }
+                // Deliberately no auto-selection here.  Saving a voice we picked
+                // ourselves would override the voice configured in Android's
+                // Text-to-speech settings; only an explicit user tap may persist one.
             } catch (e: Exception) {
                 ttsVoicesError = e.message ?: "Failed to load voices"
             } finally {
@@ -372,12 +370,13 @@ fun SettingsScreen(onBack: () -> Unit) {
         elevenVoice = s.elevenVoiceId
         wakeEnabled = s.wakeEnabled
         speakerVerificationEnabled = s.speakerVerificationEnabled
-        // Load saved TTS voice
-        s.ttsVoiceId?.let {
+        // Load saved TTS voice — only an explicit user choice is honoured; anything
+        // blank or unreadable stays null so AndroidTts uses the system voice.
+        s.ttsVoiceUserId?.takeIf { it.isNotBlank() }?.let {
             try {
                 selectedTtsVoice = Json { ignoreUnknownKeys = true }.decodeFromString(TtsVoice.serializer(), it)
             } catch (e: Exception) {
-                // ignore, will auto-select
+                // Ignore invalid saved voice; keep system default.
             }
         }
         loaded = true
@@ -582,7 +581,7 @@ SettingsDivider()
                         onExpandedChange = { ttsVoicesExpanded = it },
                     ) {
                         OutlinedTextField(
-                            value = selectedTtsVoice?.let { "$it.name (${it.locale})" } ?: "Auto (best male English)",
+                            value = selectedTtsVoice?.let { "$it.name (${it.locale})" } ?: "System default (Android settings)",
                             onValueChange = {},
                             readOnly = true,
                             label = { Text("Voice") },
@@ -597,11 +596,11 @@ SettingsDivider()
                             onDismissRequest = { ttsVoicesExpanded = false },
                             modifier = Modifier.heightIn(max = 340.dp),
                         ) {
-                            // Auto option
+                            // Default option — no in-app voice, AndroidTts uses the phone's system voice
                             DropdownMenuItem(
                                 text = {
                                     Text(
-                                        "Auto (best male English)",
+                                        "System default (Android settings)",
                                         fontFamily = DmSans,
                                         fontWeight = FontWeight.Medium,
                                         fontSize = 14.sp,
