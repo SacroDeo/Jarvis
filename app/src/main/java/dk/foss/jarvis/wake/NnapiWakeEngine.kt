@@ -110,6 +110,28 @@ class NnapiWakeEngine(
         // How many full-pipeline chunks between per-model timing log lines.
         // 150 chunks × 80 ms = ~12 s.  Set to 63 (≈ 5 s) for faster initial feedback.
         const val TIMING_LOG_INTERVAL = 150
+
+        // ── Execution provider per model ────────────────────────────────────────
+        // mel keeps its existing NNAPI path: it is the only model doing real FFT
+        // work, and its NNAPI output has already been validated against the CPU
+        // reference by runMelDiagnostic().
+        //
+        // embedding_model and jarvis_v1 run on the CPU EP.  The wake classifier maps
+        // 1 536 floats to a SINGLE output, yet emb + wake together are ~83 % of
+        // inference wall time — so their cost is dominated by fixed per-run() overhead
+        // rather than arithmetic, which is exactly what ORT's MLAS CPU kernels avoid.
+        //
+        // ROLLBACK: set both back to true to restore the previous all-NNAPI behaviour.
+        // The A/B shadow sessions are only created when these are false, so flipping
+        // them back removes the diagnostic entirely.
+        const val MEL_USE_NNAPI = true
+        const val EMB_USE_NNAPI = false
+        const val WAKE_USE_NNAPI = false
+
+        // Speech chunks compared between the CPU path and the shadow NNAPI path.
+        // 20 chunks ≈ 1.6 s of speech — enough to expose a systematic score shift,
+        // but explicitly NOT a statistical equivalence proof.  See runEpDiagnostic().
+        const val EP_DIAG_MAX_SAMPLES = 20
     }
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
@@ -197,6 +219,25 @@ class NnapiWakeEngine(
     private var melCpuSessForDiag: OrtSession? = null
     @Volatile private var melDiagDone = false
 
+    // ── Shadow NNAPI sessions: A/B comparison for emb + wake ───────────────────
+    // Created in initSessions() only when EMB_USE_NNAPI / WAKE_USE_NNAPI are false,
+    // so the new CPU path can be run against the previous NNAPI path on IDENTICAL
+    // audio and compared directly — value diff and wall time for both.
+    // Closed by runEpDiagnostic() once EP_DIAG_MAX_SAMPLES chunks are compared, and
+    // by closeSessions() as a backstop if the engine dies first.  After the sample
+    // budget is exhausted this never runs again, so steady-state idle cost is zero.
+    // Accessed only from the single Dispatchers.Default recording coroutine — same
+    // thread-safety contract as the timing accumulators below.
+    private var embNnapiSessForDiag: OrtSession? = null
+    private var wakeNnapiSessForDiag: OrtSession? = null
+    @Volatile private var epDiagDone = false
+    private var epDiagSamples = 0
+    private var epDiagEmbDiffMax = 0f
+    private var epDiagScoreDiffMax = 0f
+    private var epDiagEmbCpuNs = 0L;   private var epDiagEmbNnapiNs = 0L
+    private var epDiagWakeCpuNs = 0L;  private var epDiagWakeNnapiNs = 0L
+    private val embVecDiagBuf = FloatArray(EMB_DIM)   // shadow NNAPI embedding output
+
     // ── Per-model inference timing accumulators (diagnostic only) ────────────
     // Accumulate wall-clock nanoseconds for each model.run() call across
     // TIMING_LOG_INTERVAL full-pipeline chunks (all three models ran, score
@@ -226,9 +267,9 @@ class NnapiWakeEngine(
             val embBytes  = assets.open("embedding_model.onnx").readBytes()
             val wakeBytes = assets.open("jarvis_v1.onnx").readBytes()
 
-            val (mel,  melNnapi)  = tryNnapiSession(melBytes,  "melspectrogram")
-            val (emb,  embNnapi)  = tryNnapiSession(embBytes,  "embedding_model")
-            val (wake, wakeNnapi) = tryNnapiSession(wakeBytes, "jarvis_v1")
+            val (mel,  melNnapi)  = tryNnapiSession(melBytes,  "melspectrogram", MEL_USE_NNAPI)
+            val (emb,  embNnapi)  = tryNnapiSession(embBytes,  "embedding_model", EMB_USE_NNAPI)
+            val (wake, wakeNnapi) = tryNnapiSession(wakeBytes, "jarvis_v1", WAKE_USE_NNAPI)
 
             melSess  = mel
             embSess  = emb
@@ -245,6 +286,26 @@ class NnapiWakeEngine(
                     Log.i(TAG, "Diagnostic CPU mel session created — will compare NNAPI vs CPU on first speech chunk (rms > $RMS_DIAG_THRESHOLD)")
                 } catch (e: Exception) {
                     Log.w(TAG, "Diagnostic CPU mel session creation failed (non-fatal): ${e.message}")
+                }
+            }
+
+            // Shadow NNAPI sessions for emb + wake, created ONLY when those models run
+            // on the CPU EP.  They exist purely so the new path can be A/B'd against
+            // the previous NNAPI path on identical audio (see runEpDiagnostic).
+            // With EMB_USE_NNAPI / WAKE_USE_NNAPI flipped back to true this block is
+            // skipped and the diagnostic disappears entirely.
+            if (!embNnapi && !wakeNnapi) {
+                runCatching {
+                    embNnapiSessForDiag = env.createSession(embBytes, sessionOptions(true))
+                    wakeNnapiSessForDiag = env.createSession(wakeBytes, sessionOptions(true))
+                    Log.i(TAG, "EP shadow NNAPI sessions created for embedding_model + jarvis_v1 " +
+                        "(diagnostic only, $EP_DIAG_MAX_SAMPLES speech chunks)")
+                }.onFailure {
+                    Log.w(TAG, "EP shadow session creation failed (diagnostic disabled): ${it.message}")
+                    runCatching { embNnapiSessForDiag?.close() }
+                    runCatching { wakeNnapiSessForDiag?.close() }
+                    embNnapiSessForDiag = null; wakeNnapiSessForDiag = null
+                    epDiagDone = true
                 }
             }
 
@@ -284,32 +345,44 @@ class NnapiWakeEngine(
      * OrtSession.SessionOptions API since ONNX Runtime 1.0 and are confirmed
      * available in onnxruntime-android 1.18.0.
      */
-    private fun tryNnapiSession(modelBytes: ByteArray, label: String): Pair<OrtSession, Boolean> {
+    /**
+     * Build a fresh [OrtSession.SessionOptions].
+     *
+     * A NEW instance is returned on every call because [OrtEnvironment.createSession]
+     * takes ownership of the options object — they can never be reused.
+     *
+     * [useNnapi] selects the execution provider.  With `false` the NNAPI EP is simply
+     * not registered, so ORT uses its own MLAS CPU kernels for the whole graph (no
+     * per-node CPU fallback inside an NNAPI session, and no driver overhead per run).
+     *
+     * Thread limits are applied on both paths: they bound the CPU EP's own pool and
+     * were already applied to the previous CPU-fallback sessions.
+     */
+    private fun sessionOptions(useNnapi: Boolean): OrtSession.SessionOptions {
+        val o = OrtSession.SessionOptions()
+        if (useNnapi) o.addNnapi()
+        o.setIntraOpNumThreads(1)
+        o.setInterOpNumThreads(1)
+        return o
+    }
+
+    private fun tryNnapiSession(modelBytes: ByteArray, label: String, useNnapi: Boolean): Pair<OrtSession, Boolean> {
         try {
-            val opts = OrtSession.SessionOptions()
-            // addNnapi(): confirmed available in onnxruntime-android 1.18.0
-            // (inspected via javap on onnxruntime-android-1.18.0.aar/classes.jar)
-            opts.addNnapi()
-            // Limit ORT's internal thread pool to one thread.  See kdoc above.
-            opts.setIntraOpNumThreads(1)
-            opts.setInterOpNumThreads(1)
-            val sess = env.createSession(modelBytes, opts)
-            Log.i(TAG, "$label: OrtSession created with NNAPI execution provider (intraOp=1, interOp=1)")
-            return sess to true
+            val sess = env.createSession(modelBytes, sessionOptions(useNnapi))
+            Log.i(TAG, "$label: OrtSession created with ${if (useNnapi) "NNAPI" else "CPU"} execution provider " +
+                "(intraOp=1, interOp=1)")
+            return sess to useNnapi
         } catch (e: OrtException) {
-            Log.w(TAG, "$label: NNAPI provider rejected (${e.message}) — creating CPU session instead")
+            Log.w(TAG, "$label: session failed (${e.message}) — creating CPU session instead")
         } catch (e: Exception) {
-            Log.w(TAG, "$label: NNAPI session failed (${e.javaClass.simpleName}: ${e.message}) — trying CPU")
+            Log.w(TAG, "$label: session failed (${e.javaClass.simpleName}: ${e.message}) — trying CPU")
         }
 
         // CPU fallback — must succeed or we rethrow.
         // Thread limits applied here too: this path runs when NNAPI is unavailable
         // or rejected, so the same multi-thread constraint applies.
-        val cpuOpts = OrtSession.SessionOptions()
-        cpuOpts.setIntraOpNumThreads(1)
-        cpuOpts.setInterOpNumThreads(1)
-        val cpuSess = env.createSession(modelBytes, cpuOpts)
-        Log.i(TAG, "$label: OrtSession created with CPU (NNAPI fallback, intraOp=1, interOp=1)")
+        val cpuSess = env.createSession(modelBytes, sessionOptions(false))
+        Log.i(TAG, "$label: OrtSession created with CPU (fallback, intraOp=1, interOp=1)")
         return cpuSess to false
     }
 
@@ -401,7 +474,10 @@ class NnapiWakeEngine(
         runCatching { embSess?.close() }
         runCatching { wakeSess?.close() }
         runCatching { melCpuSessForDiag?.close() }
+        runCatching { embNnapiSessForDiag?.close() }
+        runCatching { wakeNnapiSessForDiag?.close() }
         melSess = null; embSess = null; wakeSess = null; melCpuSessForDiag = null
+        embNnapiSessForDiag = null; wakeNnapiSessForDiag = null
     }
 
     // ── Three-stage inference pipeline ───────────────────────────────────────
@@ -564,6 +640,20 @@ class NnapiWakeEngine(
                 Log.i(TAG, "NNAPI engine: first wake score=$score (nnApiEnabled=$nnApiEnabled) — inference confirmed")
             }
 
+            // ── A/B diagnostic: CPU path vs shadow NNAPI path on IDENTICAL audio ────
+            // Gated on the same RMS speech test as the mel diagnostic, so it NEVER runs
+            // during silence — idle CPU measurements are therefore unaffected.  It
+            // self-terminates after EP_DIAG_MAX_SAMPLES chunks and releases its shadow
+            // sessions, so the only period where it inflates cost is the first ~1.6 s of
+            // speech after start-up.  Not on the hot path once exhausted.
+            if (!epDiagDone && embNnapiSessForDiag != null && wakeNnapiSessForDiag != null) {
+                var sumSq = 0.0
+                for (s in samples) sumSq += s.toDouble() * s
+                if (Math.sqrt(sumSq / CHUNK_SAMPLES).toFloat() > RMS_DIAG_THRESHOLD) {
+                    runEpDiagnostic(embFlatBuf, wakeFlatBuf, embVecBuf, score, localEmbNs, localWakeNs)
+                }
+            }
+
             // ── Inference timing accumulation ─────────────────────────────────────
             // Placed before onScore() so the sample is recorded regardless of
             // callback behaviour.  Only reached when all three model.run() calls
@@ -687,6 +777,127 @@ class NnapiWakeEngine(
             runCatching { melCpuSessForDiag?.close() }
             melCpuSessForDiag = null
             Log.i(TAG, "=== MEL DIAGNOSTIC complete — CPU session released ===")
+        }
+    }
+
+    /**
+     * One-shot A/B diagnostic: run the shadow NNAPI embedding and wake sessions
+     * against the production CPU sessions on IDENTICAL audio, and compare both the
+     * raw embedding values and the resulting wake score.
+     *
+     * Control: the same [embFlat] tensor is fed to both providers, so any difference
+     * is attributable to the provider alone.  For the wake model the window is
+     * identical except that the newest slot (index [EMB_WINDOW] - 1) carries the
+     * shadow embedding, isolating that model's contribution end-to-end.
+     *
+     * [wakeFlat] is left holding the shadow embedding afterwards; this is safe
+     * because it is fully rebuilt from [embWindow] at the top of the next chunk
+     * (see processChunk) before any further use.
+     *
+     * Releases both shadow sessions once [EP_DIAG_MAX_SAMPLES] chunks are compared,
+     * or on any exception — never on the hot path.
+     *
+     * **Limitations — this is indicative, not proof of equivalence:**
+     *  - N is small (default 20 speech chunks ≈ 1.6 s).  It reliably exposes a
+     *    *systematic* shift but cannot bound the tail of the distribution.
+     *  - Samples are gated on RMS > [RMS_DIAG_THRESHOLD], i.e. biased toward LOUDER
+     *    audio. Quiet or far-field wake conditions are not represented.
+     *  - Real "Hey Jarvis" peaks are rare; most samples are ordinary speech, so the
+     *    score delta at an actual wake peak is not directly sampled.
+     *  - Only the newest embedding slot is swapped for the wake comparison, so
+     *    correlated drift across all 16 slots is not fully captured.
+     *  - Wall-clock numbers are subject to cache state and background load.
+     *
+     * Detection equivalence must therefore be established on-device by the 50-attempt
+     * wake test and the 30-minute false-wake test — not by this log.
+     */
+    private fun runEpDiagnostic(
+        embFlat: FloatArray,
+        wakeFlat: FloatArray,
+        prodEmb: FloatArray,
+        prodScore: Float,
+        prodEmbNs: Long,
+        prodWakeNs: Long,
+    ) {
+        val embShadow = embNnapiSessForDiag
+        val wakeShadow = wakeNnapiSessForDiag
+        if (embShadow == null || wakeShadow == null) { epDiagDone = true; return }
+
+        try {
+            // ── embedding: identical input tensor, both providers ──────────────
+            val eIn = OnnxTensor.createTensor(env, FloatBuffer.wrap(embFlat),
+                longArrayOf(1L, MEL_WINDOW.toLong(), MEL_BINS.toLong(), 1L))
+            val eT0 = System.nanoTime()
+            val eRes = embShadow.run(mapOf(EMB_IN to eIn))
+            val shadowEmbNs = System.nanoTime() - eT0
+            try {
+                (eRes.get(0) as OnnxTensor).getFloatBuffer().get(embVecDiagBuf)
+            } finally {
+                eRes.close(); eIn.close()
+            }
+
+            var embDiff = 0f
+            for (i in 0 until EMB_DIM) {
+                val d = Math.abs(prodEmb[i] - embVecDiagBuf[i])
+                if (d > embDiff) embDiff = d
+            }
+
+            // ── wake: same window, newest embedding replaced by the shadow one ─
+            System.arraycopy(embVecDiagBuf, 0, wakeFlat, (EMB_WINDOW - 1) * EMB_DIM, EMB_DIM)
+            val wIn = OnnxTensor.createTensor(env, FloatBuffer.wrap(wakeFlat),
+                longArrayOf(1L, EMB_WINDOW.toLong(), EMB_DIM.toLong()))
+            val wT0 = System.nanoTime()
+            val wRes = wakeShadow.run(mapOf(WAKE_IN to wIn))
+            val shadowWakeNs = System.nanoTime() - wT0
+            val shadowScore: Float
+            try {
+                shadowScore = (wRes.get(0) as OnnxTensor).getFloatBuffer().get()
+            } finally {
+                wRes.close(); wIn.close()
+            }
+
+            val scoreDiff = Math.abs(prodScore - shadowScore)
+
+            if (embDiff > epDiagEmbDiffMax) epDiagEmbDiffMax = embDiff
+            if (scoreDiff > epDiagScoreDiffMax) epDiagScoreDiffMax = scoreDiff
+            epDiagEmbCpuNs += prodEmbNs;    epDiagEmbNnapiNs += shadowEmbNs
+            epDiagWakeCpuNs += prodWakeNs;  epDiagWakeNnapiNs += shadowWakeNs
+            epDiagSamples++
+
+            if (epDiagSamples <= 3) {
+                Log.i(TAG, "EP-DIAG sample $epDiagSamples  " +
+                    "emb cpu=%.2fms nnapi=%.2fms maxAbsDiff=%.5f  |  " +
+                    "wake cpu=%.2fms nnapi=%.2fms  score cpu=%.4f nnapi=%.4f diff=%.5f"
+                    .format(prodEmbNs / 1_000_000.0, shadowEmbNs / 1_000_000.0, embDiff,
+                            prodWakeNs / 1_000_000.0, shadowWakeNs / 1_000_000.0,
+                            prodScore, shadowScore, scoreDiff))
+            }
+
+            if (epDiagSamples >= EP_DIAG_MAX_SAMPLES) {
+                val n = epDiagSamples.toLong()
+                Log.w(TAG, "=== EP DIAGNOSTIC SUMMARY (n=$epDiagSamples speech chunks) ===")
+                Log.w(TAG, "  embedding  CPU avg=%.2fms  NNAPI avg=%.2fms  NNAPI/CPU=%.2fx"
+                    .format(epDiagEmbCpuNs / n / 1_000_000.0, epDiagEmbNnapiNs / n / 1_000_000.0,
+                            epDiagEmbNnapiNs.toDouble() / maxOf(1L, epDiagEmbCpuNs)))
+                Log.w(TAG, "  wake       CPU avg=%.2fms  NNAPI avg=%.2fms  NNAPI/CPU=%.2fx"
+                    .format(epDiagWakeCpuNs / n / 1_000_000.0, epDiagWakeNnapiNs / n / 1_000_000.0,
+                            epDiagWakeNnapiNs.toDouble() / maxOf(1L, epDiagWakeCpuNs)))
+                Log.w(TAG, "  max |emb| diff=%.6f   max |score| diff=%.6f"
+                    .format(epDiagEmbDiffMax, epDiagScoreDiffMax))
+                Log.w(TAG, "  NOTE: indicative only — ${EP_DIAG_MAX_SAMPLES} speech chunks, RMS-gated. " +
+                    "Not a statistical equivalence proof; verify with the on-device wake test.")
+                // Release the shadow sessions — never used again.
+                runCatching { embNnapiSessForDiag?.close() }
+                runCatching { wakeNnapiSessForDiag?.close() }
+                embNnapiSessForDiag = null; wakeNnapiSessForDiag = null
+                epDiagDone = true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "EP diagnostic failed (non-fatal, disabling): ${e.message}")
+            runCatching { embNnapiSessForDiag?.close() }
+            runCatching { wakeNnapiSessForDiag?.close() }
+            embNnapiSessForDiag = null; wakeNnapiSessForDiag = null
+            epDiagDone = true
         }
     }
 
