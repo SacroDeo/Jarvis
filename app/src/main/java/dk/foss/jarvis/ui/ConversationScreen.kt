@@ -88,6 +88,22 @@ fun ConversationScreen(vm: ConversationViewModel, assistTrigger: Int, onExit: ()
         if (granted) vm.startListening()
     }
 
+    // Lazy READ_CONTACTS request driven by the ViewModel's call flow. The nonce
+    // correlates the result with the waiting call stage; stale results are ignored.
+    var contactsNonce by remember { mutableStateOf(0) }
+    val contactsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        vm.onContactsPermissionResult(granted, contactsNonce)
+    }
+    val contactsPermissionRequest by vm.contactsPermissionRequest
+    LaunchedEffect(contactsPermissionRequest) {
+        if (contactsPermissionRequest > 0) {
+            contactsNonce = contactsPermissionRequest
+            contactsLauncher.launch(Manifest.permission.READ_CONTACTS)
+        }
+    }
+
     LaunchedEffect(Unit) {
         vm.resetView()
         if (!hasPermission) {

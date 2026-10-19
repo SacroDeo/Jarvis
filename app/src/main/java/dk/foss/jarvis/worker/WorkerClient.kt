@@ -39,9 +39,13 @@ class WorkerClient(
         model: String, // ignored; Worker uses its configured model
         sessionId: String?, // ignored; Worker is stateless
         cb: StreamCallbacks,
+        responseFormat: JsonSchemaResponseFormat? = null,
     ): Runnable {
         val requestMessages = messages.map { ChatMessage(it.role, it.content) }
-        val body = json.encodeToString(WorkerChatRequest.serializer(), WorkerChatRequest(requestMessages))
+        val body = json.encodeToString(
+            WorkerChatRequest.serializer(),
+            WorkerChatRequest(requestMessages, responseFormat),
+        )
 
         val request = Request.Builder()
             .url("$baseUrl/chat")

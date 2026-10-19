@@ -1,10 +1,25 @@
 package dk.foss.jarvis.worker
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonObject
 
 @Serializable
 data class WorkerChatRequest(
     val messages: List<ChatMessage>,
+    val response_format: JsonSchemaResponseFormat? = null,
+)
+
+@Serializable
+data class JsonSchemaResponseFormat(
+    val type: String = "json_schema",
+    val json_schema: JsonSchemaSpec,
+)
+
+@Serializable
+data class JsonSchemaSpec(
+    val name: String,
+    val strict: Boolean = true,
+    val schema: JsonObject,
 )
 
 @Serializable

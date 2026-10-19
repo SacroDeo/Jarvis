@@ -14,12 +14,22 @@ interface ChatMessage {
   content: string;
 }
 
+interface JsonSchemaResponseFormat {
+  type: "json_schema";
+  json_schema: {
+    name: string;
+    strict?: boolean;
+    schema: Record<string, unknown>;
+  };
+}
+
 interface ChatRequest {
   messages: ChatMessage[];
   model?: string;
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  response_format?: JsonSchemaResponseFormat | null;
 }
 
 interface ChatResponse {
@@ -98,16 +108,21 @@ async function callLLM(
   messages: ChatMessage[],
   model: string,
   env: Env,
-  signal: AbortSignal
+  signal: AbortSignal,
+  responseFormat?: JsonSchemaResponseFormat
 ): Promise<ChatResponse> {
   const url = `${env.LLM_BASE_URL}/chat/completions`;
-  const body = JSON.stringify({
+  const bodyObj: Record<string, unknown> = {
     model,
     messages,
     stream: false,
     temperature: 0.7,
     max_tokens: 2048,
-  });
+  };
+  if (responseFormat) {
+    bodyObj.response_format = responseFormat;
+  }
+  const body = JSON.stringify(bodyObj);
 
   const response = await fetch(url, {
     method: "POST",
@@ -271,7 +286,30 @@ export default {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), parseInt(env.REQUEST_TIMEOUT_MS));
 
-        const llmResponse = await callLLM(chatRequest.messages, model, env, controller.signal);
+        // Only accept strict json_schema response_format; treat null/absent as omit.
+        let responseFormat: JsonSchemaResponseFormat | undefined;
+        if (chatRequest.response_format) {
+          const rf = chatRequest.response_format;
+          if (
+            rf.type === "json_schema" &&
+            rf.json_schema &&
+            typeof rf.json_schema.name === "string" &&
+            rf.json_schema.schema &&
+            typeof rf.json_schema.schema === "object"
+          ) {
+            responseFormat = {
+              type: "json_schema",
+              json_schema: {
+                name: rf.json_schema.name,
+                strict: true, // always enforce strict mode for safety
+                schema: rf.json_schema.schema as Record<string, unknown>,
+              },
+            };
+          } else {
+            return createErrorResponse(400, "Invalid response_format; only json_schema supported", env, origin);
+          }
+        }
+        const llmResponse = await callLLM(chatRequest.messages, model, env, controller.signal, responseFormat);
 
         clearTimeout(timeoutId);
 

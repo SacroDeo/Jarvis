@@ -1,12 +1,20 @@
 package dk.foss.jarvis.ui
 
 import android.app.Application
+import android.content.Intent
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dk.foss.jarvis.contacts.CallFlowPolicy
+import dk.foss.jarvis.contacts.ContactCandidate
+import dk.foss.jarvis.contacts.ContactResolver
+import dk.foss.jarvis.contacts.LookupResult
+import dk.foss.jarvis.contacts.PhoneNumber
+import dk.foss.jarvis.contacts.ToolRegistry
 import dk.foss.jarvis.data.ConversationRepository
 import dk.foss.jarvis.data.JarvisSettings
 import dk.foss.jarvis.data.SettingsStore
@@ -22,12 +30,45 @@ import dk.foss.jarvis.voice.TtsEngine
 import dk.foss.jarvis.voice.TtsVoice
 import dk.foss.jarvis.voice.VoiceRecognizer
 import dk.foss.jarvis.wake.WakeWordService
+import dk.foss.jarvis.worker.ChatMessage
+import dk.foss.jarvis.worker.JsonSchemaResponseFormat
+import dk.foss.jarvis.worker.JsonSchemaSpec
 import dk.foss.jarvis.worker.WorkerClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
 enum class ConvState { Idle, Listening, Thinking, Speaking }
+
+/**
+ * Stages of the voice-only call flow. [None] means no call flow is active.
+ * All transitions away from an active stage MUST go through [cancelCallFlow].
+ */
+private sealed class CallStage {
+    object None : CallStage()
+
+    /** READ_CONTACTS not yet granted; [token] matches [contactsPermissionRequest]. */
+    data class PermissionWait(val token: Int, val query: String, val ack: String) : CallStage()
+
+    /** Several contacts matched — awaiting spoken ordinal. */
+    data class ClarifyContacts(val query: String, val candidates: List<ContactCandidate>) : CallStage()
+
+    /** One contact, several numbers — awaiting spoken ordinal. */
+    data class ClarifyNumbers(val contact: ContactCandidate) : CallStage()
+
+    /** Local round-trip re-ask (no matches / ambiguous) — tool disabled for this turn. */
+    object RoundTrip : CallStage()
+
+    /**
+     * Contact lookup is running on [Dispatchers.IO] inside [resolveAndRouteCall].
+     * [onComplete] must not call [completeStructuredTurn] or advance the turn while
+     * this stage is set; the coroutine will transition to the next stage (or cancel
+     * via the token/turn guards) when the ContentProvider query returns.
+     */
+    object ToolLookupInProgress : CallStage()
+}
 
 class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -48,6 +89,26 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     val hint = mutableStateOf<String?>(null)
     val working = mutableStateOf(false)
     val stalled = mutableStateOf(false)
+
+    // ── call-flow state ────────────────────────────────────────────────────────
+    // Nonce > 0 signals ConversationScreen to launch the READ_CONTACTS prompt once.
+    val contactsPermissionRequest = mutableStateOf(0)
+    private var callStage: CallStage = CallStage.None
+    private var callFlowToken = 0
+    private val callFlowTimeout = Runnable {
+        if (callStage is CallStage.ClarifyContacts || callStage is CallStage.ClarifyNumbers) {
+            cancelCallFlow()
+            hint.value = "No answer — cancelled."
+            goIdle()
+        }
+    }
+    private val permissionWaitTimeout = Runnable {
+        if (callStage is CallStage.PermissionWait) {
+            cancelCallFlow()
+            hint.value = "No answer — cancelled."
+            goIdle()
+        }
+    }
 
     // --- follow-along reply display state ---
     val segments = androidx.compose.runtime.mutableStateListOf<String>()
@@ -77,6 +138,9 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private var streamDone = false
     private var turn = 0 // bumped each turn; stale async callbacks check this and bail
     private var retriedThisTurn = false
+    // True when the current structured response was a plain reply (persist it);
+    // false for tool calls (their prompts are UI-only and must not enter history).
+    private var lastOutcomeWasReply = true
 
     // While idle in a conversation we re-arm "Hey Jarvis" so the user can re-activate
     // by voice. Loop-breaker: if wake-triggered turns keep coming back empty, stop
@@ -238,6 +302,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         sentenceBuffer.setLength(0)
         speaking = false
         streamDone = false
+        lastOutcomeWasReply = true
         segments.clear()
         speakingIndex.value = -1
         pendingText.value = ""
@@ -255,6 +320,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun resetView() {
         turn++ // invalidate any in-flight callbacks from a prior screen visit
+        cancelCallFlow()
         main.removeCallbacks(rearmWake)
         main.removeCallbacks(bargeInRearm)
         cancelSilenceExit()
@@ -274,6 +340,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         speakingIndex.value = -1
         pendingText.value = ""
         spokenCount = 0
+        lastOutcomeWasReply = true
         state.value = ConvState.Idle
     }
 
@@ -304,10 +371,20 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 cancelListeningWatchdog()
                 transcript.value = text
                 when {
-                    text.isBlank()         -> goIdle()
-                    isSilenceCommand(text) -> handleSilenceCommand()
-                    isExitCommand(text)    -> handleExitCommand()
-                    else                   -> think(text)
+                    text.isBlank() -> {
+                        // Blank during a pending call stage: cancel and idle, never dial.
+                        if (callStage !is CallStage.None) cancelCallFlow()
+                        goIdle()
+                    }
+                    isSilenceCommand(text) -> {
+                        cancelCallFlow()
+                        handleSilenceCommand()
+                    }
+                    isExitCommand(text) -> {
+                        cancelCallFlow()
+                        handleExitCommand()
+                    }
+                    else -> handleCallStageAnswer(text)
                 }
             }
 
@@ -396,11 +473,103 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         exitRequested.value = true
     }
 
+    /**
+     * Dispatch a recognised answer while a call stage (or normal conversation) is
+     * active. Clarification answers are matched locally; anything unclear cancels the
+     * call flow and falls back to a normal LLM turn.
+     * Exact unique matches are dialled immediately without a yes/no confirmation step.
+     */
+    private fun handleCallStageAnswer(text: String) {
+        when (val stage = callStage) {
+            is CallStage.ClarifyContacts -> {
+                val idx = CallFlowPolicy.parseOrdinal(text)
+                if (idx != null && idx in 1..stage.candidates.size) {
+                    val contact = stage.candidates[idx - 1]
+                    cancelCallFlow()
+                    when {
+                        contact.numbers.isEmpty() -> {
+                            enqueueSpeech("${contact.displayName} has no phone number saved.")
+                            streamDone = true
+                            pump()
+                        }
+                        contact.numbers.size == 1 -> dial(contact, contact.numbers[0])
+                        else -> {
+                            callStage = CallStage.ClarifyNumbers(contact)
+                            val prompt = CallFlowPolicy.clarifyNumbersPrompt(
+                                contact.displayName,
+                                contact.numbers.map { it.label },
+                            )
+                            reply.value = prompt
+                            speakAndListenForStage(prompt)
+                        }
+                    }
+                } else if (CallFlowPolicy.isDenial(text)) {
+                    cancelCallFlow()
+                    enqueueSpeech("Okay, cancelled.")
+                    streamDone = true
+                    pump()
+                } else {
+                    // Not a recognised ordinal — treat as a fresh request.
+                    cancelCallFlow()
+                    think(text)
+                }
+            }
+            is CallStage.ClarifyNumbers -> {
+                val idx = CallFlowPolicy.parseOrdinal(text)
+                if (idx != null && idx in 1..stage.contact.numbers.size) {
+                    val number = stage.contact.numbers[idx - 1]
+                    cancelCallFlow()
+                    dial(stage.contact, number)
+                } else if (CallFlowPolicy.isDenial(text)) {
+                    cancelCallFlow()
+                    enqueueSpeech("Okay, cancelled.")
+                    streamDone = true
+                    pump()
+                } else {
+                    cancelCallFlow()
+                    think(text)
+                }
+            }
+            is CallStage.ToolLookupInProgress,
+            is CallStage.PermissionWait,
+            is CallStage.RoundTrip -> {
+                // These stages own the mic separately; if speech somehow arrives here,
+                // cancel and re-route as a fresh request.
+                cancelCallFlow()
+                think(text)
+            }
+            is CallStage.None -> think(text)
+        }
+    }
+
+    /** Launch the system dialer via ACTION_DIAL — never places the call directly. */
+    private fun dial(contact: ContactCandidate, number: PhoneNumber) {
+        val context = getApplication<Application>()
+        val intent = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number.number, null))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching {
+            context.startActivity(intent)
+        }.onFailure {
+            enqueueSpeech("I couldn't open the phone app.")
+            streamDone = true
+            pump()
+            return
+        }
+        // Add a short, generic assistant acknowledgement so history is not left with a
+        // dangling user request and no assistant response. Neither the contact name nor
+        // any phone number digits are included — those stay on-device only.
+        repo.addMessage("assistant", "Okay, opening the phone app.")
+        viewModelScope.launch { repo.persist() }
+        goIdle()
+    }
+
     // ──────────────────────────────────────────────────────────────────────────────
 
     private fun think(userText: String) {
         val myTurn = turn
         emptyWakeTurns = 0 // got real speech — reset the wake loop-breaker
+        // A new model request always supersedes any pending call flow.
+        cancelCallFlow()
         // No longer listening: the stuck-recognizer watchdog no longer applies.
         cancelListeningWatchdog()
         hint.value = null
@@ -416,43 +585,320 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             hint.value = "Filtered: ${filterResult.detectedTypes.joinToString(", ")}"
         }
         repo.addMessage("user", sanitizedText)
-        val requestHistory = repo.historyForRequest()
+        // Tool-enforcement system prompt is prepended for the voice path only.
+        val requestHistory = listOf(ChatMessage("system", ToolRegistry.SYSTEM_PROMPT)) +
+            repo.historyForRequest()
 
         val s = settings ?: return
         val client = WorkerClient(s.workerUrl, s.workerToken)
-        cancelRunnable = client.streamChat(requestHistory, s.model, repo.sessionId, object : WorkerClient.StreamCallbacks {
-            override fun onDelta(textDelta: String) = onMain {
-                if (turn == myTurn) onTextDelta(textDelta)
+        val structured = JsonSchemaResponseFormat(
+            type = "json_schema",
+            json_schema = JsonSchemaSpec(
+                name = "assistant_envelope",
+                strict = true,
+                schema = ToolRegistry.CALL_ENVELOPE_SCHEMA,
+            ),
+        )
+        cancelRunnable = client.streamChat(
+            requestHistory,
+            s.model,
+            repo.sessionId,
+            object : WorkerClient.StreamCallbacks {
+                override fun onDelta(textDelta: String) = onMain {
+                    if (turn == myTurn) handleStructuredContent(textDelta, myTurn, allowTool = true)
+                }
+
+                override fun onSessionId(id: String) { repo.setSessionId(id) }
+
+                override fun onComplete() = onMain {
+                    if (turn != myTurn) return@onMain
+                    // An Invalid/error turn already went idle — don't resurrect it.
+                    if (error.value != null) {
+                        main.removeCallbacks(stallIndicator)
+                        working.value = false
+                        stalled.value = false
+                        return@onMain
+                    }
+                    // Round-trip turn: this first onComplete belongs to the clarification
+                    // re-ask, not a real reply — skip it; the follow-up request completes.
+                    if (callStage is CallStage.RoundTrip) {
+                        callStage = CallStage.None
+                        return@onMain
+                    }
+                    // Contact lookup is running on Dispatchers.IO.  The coroutine in
+                    // resolveAndRouteCall will drive the call-flow stages (clarification /
+                    // confirmation) when it returns.  Do not call completeStructuredTurn()
+                    // here — that would set streamDone=true, call pump() → finishTurn() →
+                    // startListening() → beginTurn() and bump turn, causing the lookup to
+                    // fail its turn guard and silently discard results.
+                    if (callStage is CallStage.ToolLookupInProgress) {
+                        main.removeCallbacks(stallIndicator)
+                        working.value = false
+                        stalled.value = false
+                        return@onMain
+                    }
+                    completeStructuredTurn()
+                }
+
+                override fun onError(message: String) = onMain {
+                    if (turn != myTurn) return@onMain
+                    main.removeCallbacks(stallIndicator)
+                    working.value = false
+                    stalled.value = false
+                    error.value = message
+                    goIdle()
+                }
+            },
+            responseFormat = structured,
+        )
+    }
+
+    /**
+     * Finish a structured turn: flush buffered speech, persist a plain reply
+     * (tokenized), and let the TTS pump decide when to listen again.
+     * Tool-call prompts are UI-only and never persisted.
+     */
+    private fun completeStructuredTurn() {
+        if (callStage is CallStage.RoundTrip) callStage = CallStage.None
+        main.removeCallbacks(idleFlush)
+        main.removeCallbacks(stallIndicator)
+        working.value = false
+        stalled.value = false
+        val rest = sentenceBuffer.toString().trim()
+        sentenceBuffer.setLength(0)
+        if (rest.isNotEmpty()) enqueueSpeech(rest)
+        pendingText.value = ""
+        if (lastOutcomeWasReply && reply.value.isNotBlank()) {
+            // Never persist phone numbers — persist the tokenized form.
+            val toPersist = privacyFilter.filter(reply.value).sanitizedText
+            repo.addMessage("assistant", toPersist)
+        }
+        viewModelScope.launch { repo.persist() }
+        streamDone = true
+        pump()
+    }
+
+    /**
+     * Route a full structured response (the Worker is non-streaming, so onDelta
+     * delivers the whole envelope at once) through the allowlisted tool registry.
+     */
+    private fun handleStructuredContent(content: String, myTurn: Int, allowTool: Boolean) {
+        if (turn != myTurn) return
+        when (val outcome = ToolRegistry.parse(content, allowTool)) {
+            is ToolRegistry.Outcome.Reply -> {
+                lastOutcomeWasReply = true
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                onTextDelta(outcome.text)
             }
-
-            override fun onSessionId(id: String) { repo.setSessionId(id) }
-
-            override fun onComplete() = onMain {
-                if (turn != myTurn) return@onMain
+            is ToolRegistry.Outcome.ToolCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                // Show ack immediately; never spoken here — confirmation speaks instead.
+                reply.value = outcome.ack.ifBlank { "One moment." }
+                executeCallTool(outcome.contactName, myTurn)
+            }
+            is ToolRegistry.Outcome.Invalid -> {
+                lastOutcomeWasReply = false
+                // Fail closed: no tool execution, no speech from a malformed envelope.
                 main.removeCallbacks(idleFlush)
                 main.removeCallbacks(stallIndicator)
                 working.value = false
                 stalled.value = false
-                // flush whatever's left as the final sentence
-                val rest = sentenceBuffer.toString().trim()
-                sentenceBuffer.setLength(0)
-                if (rest.isNotEmpty()) enqueueSpeech(rest)
-                pendingText.value = ""
-                if (reply.value.isNotBlank()) repo.addMessage("assistant", reply.value)
-                viewModelScope.launch { repo.persist() }
-                streamDone = true
-                pump()
-            }
-
-            override fun onError(message: String) = onMain {
-                if (turn != myTurn) return@onMain
-                main.removeCallbacks(stallIndicator)
-                working.value = false
-                stalled.value = false
-                error.value = message
+                error.value = "Jarvis sent an unreadable response."
                 goIdle()
             }
-        })
+        }
+    }
+
+    /**
+     * Resolve a [call_contact] tool request locally, then enter the voice-only
+     * clarification / confirmation loop. Never dials without exact confirmation.
+     */
+    private fun executeCallTool(contactName: String, myTurn: Int) {
+        if (turn != myTurn) return
+        // Lazy permission check: if READ_CONTACTS is missing, ask for it once.
+        val granted = android.content.pm.PackageManager.PERMISSION_GRANTED ==
+            getApplication<Application>().checkSelfPermission(android.Manifest.permission.READ_CONTACTS)
+        if (!granted) {
+            val token = ++callFlowToken
+            callStage = CallStage.PermissionWait(token, contactName, reply.value)
+            state.value = ConvState.Idle
+            hint.value = null
+            contactsPermissionRequest.value = token
+            enqueueSpeech("I need access to your contacts to find ${contactName}. Please allow access.")
+            main.removeCallbacks(permissionWaitTimeout)
+            main.postDelayed(permissionWaitTimeout, PERMISSION_WAIT_MS)
+            return
+        }
+        resolveAndRouteCall(contactName, myTurn)
+    }
+
+    /**
+     * Contacts lookup + stage selection, using [ContactResolver.lookup] to separate
+     * exact from approximate matches.
+     *
+     * - [LookupResult.ExactUnique]    — one name matches exactly; dial immediately if
+     *   only one number is saved, or ask which number first if there are several.
+     * - [LookupResult.ExactAmbiguous] — multiple contacts share the same exact name;
+     *   ask which person the user means.
+     * - [LookupResult.FuzzyMatches]   — no exact match but plausible alternatives found;
+     *   ask which one using the "did you mean" prompt.
+     * - [LookupResult.NotFound]       — nothing found; round-trip LLM reask.
+     *
+     * The ContentProvider query runs on [Dispatchers.IO]; all UI mutations resume on Main.
+     */
+    private fun resolveAndRouteCall(contactName: String, myTurn: Int) {
+        if (turn != myTurn) return
+        val context = getApplication<Application>()
+        val myToken = callFlowToken
+        callStage = CallStage.ToolLookupInProgress
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                ContactResolver.lookup(context, contactName)
+            }
+            if (turn != myTurn || callFlowToken != myToken) return@launch
+            when (result) {
+                is LookupResult.ExactUnique -> {
+                    val contact = result.contact
+                    when {
+                        contact.numbers.isEmpty() -> {
+                            cancelCallFlow()
+                            enqueueSpeech("I found ${contact.displayName}, but they have no phone number saved.")
+                            streamDone = true
+                            pump()
+                        }
+                        contact.numbers.size == 1 -> {
+                            // Single exact match, single number — dial without extra confirmation.
+                            cancelCallFlow()
+                            dial(contact, contact.numbers[0])
+                        }
+                        else -> {
+                            // Single exact match, multiple numbers — ask which one.
+                            callStage = CallStage.ClarifyNumbers(contact)
+                            val prompt = CallFlowPolicy.clarifyNumbersPrompt(
+                                contact.displayName,
+                                contact.numbers.map { it.label },
+                            )
+                            reply.value = prompt
+                            speakAndListenForStage(prompt)
+                        }
+                    }
+                }
+                is LookupResult.ExactAmbiguous -> {
+                    callStage = CallStage.ClarifyContacts(contactName, result.contacts)
+                    val prompt = CallFlowPolicy.clarifyContactsPrompt(result.contacts.map { it.displayName })
+                    reply.value = prompt
+                    speakAndListenForStage(prompt)
+                }
+                is LookupResult.FuzzyMatches -> {
+                    callStage = CallStage.ClarifyContacts(contactName, result.contacts)
+                    val prompt = CallFlowPolicy.fuzzyMatchPrompt(result.contacts.map { it.displayName })
+                    reply.value = prompt
+                    speakAndListenForStage(prompt)
+                }
+                is LookupResult.NotFound -> {
+                    roundTripReask("No contact named \"$contactName\" was found. Ask the user for a more specific name.")
+                }
+            }
+        }
+    }
+
+    /** Speak a clarification / confirmation prompt, then listen for the answer. */
+    private fun speakAndListenForStage(prompt: String) {
+        enqueueSpeech(prompt)
+        streamDone = true
+        pump() // finishTurn() will startListening() once speech completes
+    }
+
+    /**
+     * Ask the model (tool disabled) to rephrase after a failed local resolution.
+     * The follow-up onComplete is swallowed via the RoundTrip stage.
+     */
+    private fun roundTripReask(note: String) {
+        val s = settings ?: return
+        callStage = CallStage.RoundTrip
+        // System note is request-only — never persisted or added to the UI history.
+        val requestHistory = listOf(ChatMessage("system", ToolRegistry.SYSTEM_PROMPT)) +
+            repo.historyForRequest() +
+            ChatMessage("system", "$note Answer with tool=\"none\" and ask a short question.")
+        val client = WorkerClient(s.workerUrl, s.workerToken)
+        val structured = JsonSchemaResponseFormat(
+            type = "json_schema",
+            json_schema = JsonSchemaSpec(
+                name = "assistant_envelope",
+                strict = true,
+                schema = ToolRegistry.CALL_ENVELOPE_SCHEMA,
+            ),
+        )
+        val myTurn = turn
+        cancelRunnable = client.streamChat(
+            requestHistory,
+            s.model,
+            repo.sessionId,
+            object : WorkerClient.StreamCallbacks {
+                override fun onDelta(textDelta: String) = onMain {
+                    if (turn == myTurn) handleStructuredContent(textDelta, myTurn, allowTool = false)
+                }
+
+                override fun onSessionId(id: String) { repo.setSessionId(id) }
+
+                override fun onComplete() = onMain {
+                    if (turn != myTurn) return@onMain
+                    if (error.value != null) {
+                        main.removeCallbacks(stallIndicator)
+                        working.value = false
+                        stalled.value = false
+                        return@onMain
+                    }
+                    completeStructuredTurn()
+                }
+
+                override fun onError(message: String) = onMain {
+                    if (turn != myTurn) return@onMain
+                    main.removeCallbacks(stallIndicator)
+                    working.value = false
+                    stalled.value = false
+                    error.value = message
+                    goIdle()
+                }
+            },
+            responseFormat = structured,
+        )
+    }
+
+    /** Invalidate the call flow: bump token, clear stage, cancel timers. */
+    private fun cancelCallFlow() {
+        callFlowToken++
+        callStage = CallStage.None
+        main.removeCallbacks(callFlowTimeout)
+        main.removeCallbacks(permissionWaitTimeout)
+    }
+
+    /** Arm the confirmation / clarification listening window. */
+    private fun armCallFlowTimeout() {
+        main.removeCallbacks(callFlowTimeout)
+        main.postDelayed(callFlowTimeout, CALL_CONFIRM_TIMEOUT_MS)
+    }
+
+    /**
+     * Result of the READ_CONTACTS permission prompt. [nonce] must match the token
+     * issued when the prompt was raised; a stale nonce is ignored.
+     */
+    fun onContactsPermissionResult(granted: Boolean, nonce: Int) {
+        val stage = callStage
+        if (nonce != callFlowToken || stage !is CallStage.PermissionWait) return
+        main.removeCallbacks(permissionWaitTimeout)
+        if (!granted) {
+            cancelCallFlow()
+            enqueueSpeech("I can't access your contacts, so I can't place that call.")
+            streamDone = true
+            pump()
+            return
+        }
+        callStage = CallStage.None
+        resolveAndRouteCall(stage.query, turn)
     }
 
     /** A token arrived: show it, and speak as soon as a full sentence is available. */
@@ -611,7 +1057,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 when {
                     text.isBlank()         -> scheduleBargeInRearm(myTurn) // nothing usable
-                    isSilenceCommand(text) -> handleSilenceCommand()
+                    isSilenceCommand(text) -> { cancelCallFlow(); handleSilenceCommand() }
                     isExitCommand(text)    -> handleExitCommand()
                     else -> {
                         // User spoke new input while Jarvis was talking — barge in.
@@ -655,6 +1101,20 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun finishTurn() {
+        // Permission wait: do not start listening — the system dialog owns input.
+        if (callStage is CallStage.PermissionWait) {
+            // Release the mic left over from the barge-in window opened while the
+            // rationale was spoken, so the permission dialog is not fighting for it.
+            runCatching { recognizer?.stop() }
+            cancelListeningWatchdog()
+            cancelSilenceExit()
+            state.value = ConvState.Idle
+            return
+        }
+        // Clarify / Confirm stages: arm the answer timeout, then listen.
+        if (callStage is CallStage.ClarifyContacts || callStage is CallStage.ClarifyNumbers) {
+            armCallFlowTimeout()
+        }
         if (continuous) startListening() else goIdle()
     }
 
@@ -708,6 +1168,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { recognizer?.stop() }
         cancelListeningWatchdog()
         main.removeCallbacks(bargeInRearm)
+        cancelCallFlow()
         state.value = ConvState.Idle
         main.removeCallbacks(rearmWake)
         // Track consecutive wake-triggered empty turns (diagnostic only).
@@ -738,6 +1199,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         continuous = false
         turn++
         emptyWakeTurns = 0
+        cancelCallFlow()
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
         main.removeCallbacks(rearmWake)
@@ -755,6 +1217,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         sentenceBuffer.setLength(0)
         speaking = false
         streamDone = false
+        lastOutcomeWasReply = true
         segments.clear()
         speakingIndex.value = -1
         pendingText.value = ""
@@ -768,6 +1231,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        cancelCallFlow()
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
         main.removeCallbacks(rearmWake)
@@ -788,6 +1252,15 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         const val IDLE_FLUSH_MS = 350L
         const val STALL_MS = 800L
         const val WAKE_REARM_DELAY_MS = 1200L
+
+        /**
+         * How long a spoken call confirmation / clarification waits for the user's
+         * answer before cancelling (never dialling).
+         */
+        const val CALL_CONFIRM_TIMEOUT_MS = 12_000L
+
+        /** How long the READ_CONTACTS system prompt waits before giving up. */
+        const val PERMISSION_WAIT_MS = 30_000L
 
         /**
          * Backoff before re-opening the barge-in recognition window after a session ends
