@@ -92,6 +92,16 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     // If content pauses while the stream is still open, the agent is likely running a tool.
     private val stallIndicator = Runnable { if (working.value) stalled.value = true }
 
+    // ── barge-in (interrupt Jarvis while it speaks) ──────────────────────────────
+    // Re-arms the interrupt recogniser after the current session ends or errors.
+    // It is a no-op unless the VM is still Speaking, so it can never outlive a turn.
+    private val bargeInRearm = Runnable { watchForInterrupt() }
+
+    // Re-arms taken during the current reply.  Reset per turn; capped so that a
+    // recogniser which can never start (permanent mic contention) degrades to "no
+    // barge-in for this reply" instead of a tight start/error loop burning battery.
+    private var bargeInRearmsThisTurn = 0
+
     // ── automatic exit after silence ────────────────────────────────────────────
     private val TAG = "JarvisConv"
 
@@ -214,6 +224,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         turn++
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
+        main.removeCallbacks(bargeInRearm)
+        bargeInRearmsThisTurn = 0
         working.value = false
         stalled.value = false
         // Stop any in-flight recognition so the next start isn't blocked by
@@ -244,6 +256,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     fun resetView() {
         turn++ // invalidate any in-flight callbacks from a prior screen visit
         main.removeCallbacks(rearmWake)
+        main.removeCallbacks(bargeInRearm)
         cancelSilenceExit()
         cancelListeningWatchdog()
         emptyWakeTurns = 0
@@ -539,47 +552,106 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Starts a concurrent recognition session as soon as TTS begins, so the user
-     * can interrupt Jarvis mid-speech by voice — without tapping first.
+     * Opens (and keeps open) a recognition session while TTS is speaking, so the user
+     * can interrupt Jarvis mid-sentence by voice — "shut up", or any other command —
+     * without tapping the mic first.
      *
-     * **Why only [SpeechInput]?**
-     * [SpeechInput] uses Android's [android.speech.SpeechRecognizer], which enables
-     * hardware acoustic echo cancellation (AEC).  AEC suppresses the TTS speaker output
-     * before the mic signal reaches the recognizer, so Jarvis does not accidentally
-     * "hear" its own speech.
+     * **Only [SpeechInput].** The ElevenLabs path uses [AudioCapture], which records raw
+     * PCM with no acoustic echo cancellation, so JARVIS's own voice would be transcribed
+     * and treated as a user command.  The on-device [SpeechInput] path is used instead;
+     * echo suppression there is whatever the platform engine provides, which is why the
+     * acceptance gate below is "the recogniser reported speech onset", not "text arrived".
      *
-     * [ScribeRecognizer] captures raw PCM via [AudioCapture] with no AEC.  TTS audio
-     * would leak into the recording, be sent to ElevenLabs Scribe, and return a
-     * garbled transcription that could be misinterpreted as a new user request.  On
-     * the ElevenLabs path the existing tap-to-interrupt path (onMicTap → beginTurn
-     * stops TTS immediately) is sufficient.
+     * **The window must be self-healing.** A [android.speech.SpeechRecognizer] session is
+     * short-lived: with nobody talking it ends in NO_MATCH / SPEECH_TIMEOUT, and while
+     * Google TTS holds the audio output it can fail outright with RECOGNIZER_BUSY /
+     * AUDIO / CLIENT.  Either way the previous implementation simply swallowed the error
+     * (Listener.onError defaults to a no-op), so one failed start left the whole reply
+     * uninterruptible.  Every terminal outcome now re-arms the window after a short
+     * backoff, for as long as the VM is still speaking.
      *
-     * **Turn safety:** [myTurn] is captured at call time.  [beginTurn] always increments
-     * [turn] before touching the recognizer, so any pending [onFinal] callback from a
-     * stale barge-in session is a guaranteed no-op ([turn] ≠ [myTurn]).
+     * **Turn safety:** [myTurn] is captured at call time and every callback re-checks it.
+     * [beginTurn], [goIdle], [stopAll], and [resetView] all advance/clear before touching
+     * the recogniser, so a stale barge-in callback can never act.
      */
     private fun watchForInterrupt() {
-        if (recognizer !is SpeechInput) return  // AEC guard — see kdoc
+        // Only meaningful while Jarvis is talking, and never re-entered while a session
+        // from this same call is already live (guarded by the state check below).
+        if (state.value != ConvState.Speaking) return
+        if (recognizer !is SpeechInput) return  // no-AEC capture path — see kdoc
         val myTurn = turn
+        var sawSpeech = false // set by onSpeechStart / onPartial, read by onFinal
+
         recognizer?.start(languageTag = null, listener = object : VoiceRecognizer.Listener {
+            override fun onSpeechStart() = onMain {
+                // Someone started talking while Jarvis speaks.  Refresh the watchdog so a
+                // long interruption is never cut off, and cancel any pending auto-exit.
+                if (turn != myTurn) return@onMain
+                sawSpeech = true
+                cancelSilenceExit()
+                armListeningWatchdog()
+            }
+
+            override fun onPartial(text: String) = onMain {
+                if (turn != myTurn) return@onMain
+                if (text.isNotEmpty()) sawSpeech = true
+                cancelSilenceExit()
+                armListeningWatchdog()
+            }
+
             override fun onFinal(text: String) = onMain {
-                if (turn != myTurn) return@onMain  // turn already advanced — stale callback
+                if (turn != myTurn) return@onMain
+                cancelListeningWatchdog()
+                if (!sawSpeech) {
+                    // Text without a reported speech onset is almost always the phone
+                    // speaker echoing back, or a decoder artefact — never act on it.
+                    // Just keep listening for the rest of this reply.
+                    scheduleBargeInRearm(myTurn)
+                    return@onMain
+                }
                 when {
-                    text.isBlank()         -> {}              // no speech / timeout — TTS continues normally
+                    text.isBlank()         -> scheduleBargeInRearm(myTurn) // nothing usable
                     isSilenceCommand(text) -> handleSilenceCommand()
                     isExitCommand(text)    -> handleExitCommand()
                     else -> {
                         // User spoke new input while Jarvis was talking — barge in.
-                        beginTurn()            // stops TTS and clears queued sentences
+                        beginTurn()            // stops TTS immediately and clears queued sentences
                         transcript.value = text
                         think(text)
                     }
                 }
             }
-            // Recognition errors during TTS (NO_MATCH, SPEECH_TIMEOUT, AUDIO, etc.) are
-            // expected — the user may simply not have spoken.  Silently ignore; the normal
-            // finishTurn → startListening path handles the next listen window.
+
+            // Recognition errors during TTS are expected (the user may simply not be
+            // speaking, or TTS may be holding the audio focus).  They must never reach
+            // the UI — the reply is still fine.  Re-arm so the window stays open.
+            override fun onError(message: String, transient: Boolean) = onMain {
+                if (turn != myTurn) return@onMain
+                Log.i(TAG, "barge-in session ended ($message) — re-arming while speaking")
+                scheduleBargeInRearm(myTurn)
+            }
         })
+    }
+
+    /**
+     * Re-open the barge-in window shortly, but only if the same turn is still speaking.
+     * Uses a fixed short backoff: long enough for a cancelling recogniser to have finished
+     * releasing the mic (avoiding ERROR_RECOGNIZER_BUSY re-entry), short enough that the
+     * gap between interruptions stays imperceptible.  [beginTurn] / [goIdle] / [stopAll]
+     * remove this callback, so a queued re-arm can never outlive the reply.
+     */
+    private fun scheduleBargeInRearm(myTurn: Int) {
+        if (turn != myTurn || state.value != ConvState.Speaking) return
+        if (bargeInRearmsThisTurn >= MAX_BARGE_IN_REARMS) {
+            // Engine cannot give us a usable session for this reply (e.g. the mic stays
+            // contended for its whole duration).  Stop trying so we do not spin; the
+            // mic-tap path remains available and the next turn retries from scratch.
+            Log.w(TAG, "barge-in unavailable after $MAX_BARGE_IN_REARMS attempts — tap still works")
+            return
+        }
+        bargeInRearmsThisTurn++
+        main.removeCallbacks(bargeInRearm)
+        main.postDelayed(bargeInRearm, BARGE_IN_REARM_MS)
     }
 
     private fun finishTurn() {
@@ -635,6 +707,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         // fires on the Scribe path, whose stop() is likewise an idempotent cancel.
         runCatching { recognizer?.stop() }
         cancelListeningWatchdog()
+        main.removeCallbacks(bargeInRearm)
         state.value = ConvState.Idle
         main.removeCallbacks(rearmWake)
         // Track consecutive wake-triggered empty turns (diagnostic only).
@@ -668,6 +741,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
         main.removeCallbacks(rearmWake)
+        main.removeCallbacks(bargeInRearm)
         cancelSilenceExit()
         cancelListeningWatchdog()
         working.value = false
@@ -697,6 +771,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         main.removeCallbacks(idleFlush)
         main.removeCallbacks(stallIndicator)
         main.removeCallbacks(rearmWake)
+        main.removeCallbacks(bargeInRearm)
         cancelSilenceExit()
         cancelListeningWatchdog()
         recognizer?.release()
@@ -713,6 +788,22 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         const val IDLE_FLUSH_MS = 350L
         const val STALL_MS = 800L
         const val WAKE_REARM_DELAY_MS = 1200L
+
+        /**
+         * Backoff before re-opening the barge-in recognition window after a session ends
+         * or errors while Jarvis is speaking.  Long enough for a cancelling
+         * SpeechRecognizer to release the mic (so the restart does not immediately hit
+         * ERROR_RECOGNIZER_BUSY), short enough that repeated interruptions feel instant.
+         */
+        const val BARGE_IN_REARM_MS = 300L
+
+        /**
+         * Ceiling on barge-in re-arms within one reply.  A healthy recogniser needs one
+         * re-arm per ~10 s of silence between sentences, so this leaves ample headroom for
+         * a long answer while still bounding worst-case work: with the 300 ms backoff the
+         * engine is never restarted more than ~3×/s, and after the cap it is left alone.
+         */
+        const val MAX_BARGE_IN_REARMS = 20
 
         // ── automatic exit after silence ───────────────────────────────────────
         // THE single place this timeout is defined.

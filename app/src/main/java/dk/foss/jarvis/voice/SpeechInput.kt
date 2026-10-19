@@ -26,7 +26,11 @@ class SpeechInput(private val context: Context) : VoiceRecognizer {
 
     private val recognitionListener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) { current?.onReady() }
-        override fun onBeginningOfSpeech() {}
+        // Speech onset is the only signal that separates the user's voice from the
+        // phone speaker leaking into the mic, so forward it to the listener.  It also
+        // lets callers re-arm their "is the user still talking?" watchdogs.  Previously
+        // this was empty, so onSpeechStart() only ever fired on the Scribe backend.
+        override fun onBeginningOfSpeech() { current?.onSpeechStart() }
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() { current?.onEnd() }
