@@ -932,7 +932,7 @@ class AppLaunchToolLogicTest {
         assertTrue("blank query should be detected", query.isBlank())
     }
 
-    @Test fun `rank logic: exact match beats prefix which beats contains`() {
+    @Test fun `rank logic exact match beats prefix which beats contains`() {
         // Use reflection-free approach: verify the ranking constants produce the
         // right relative ordering via string scoring logic.
         val query = "youtube"
@@ -957,7 +957,7 @@ class AppLaunchToolLogicTest {
         }
     }
 
-    @Test fun `activity class name resolution: absolute vs relative`() {
+    @Test fun `activity class name resolution absolute vs relative`() {
         // Verify the class-name normalization that replaced getLaunchIntentForPackage.
         val pkg = "com.google.android.youtube"
         val absoluteClass = "com.google.android.youtube.MainActivity"
