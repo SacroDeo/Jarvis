@@ -937,10 +937,13 @@ class AppLaunchToolLogicTest {
         // right relative ordering via string scoring logic.
         val query = "youtube"
         val cases = mapOf(
-            "youtube"      to 0,   // exact
-            "youtube kids" to 1,   // starts with
-            "mytube"       to 3,   // contains (doesn't start with, no word start)
+            "youtube"           to 0,   // exact
+            "youtube kids"      to 1,   // starts with
+            "get youtube"       to 2,   // word in label starts with query ("youtube" starts with "youtube")
+            "watchyoutube"      to 3,   // label contains query as substring; "watchyoutube".contains("youtube")==true
         )
+        // Note: "mytube" was an incorrect example — "mytube".contains("youtube") == false,
+        // so it would score Int.MAX_VALUE (no match), not 3.
         for ((label, expectedScore) in cases) {
             val labelLower = label.lowercase()
             val score = when {
