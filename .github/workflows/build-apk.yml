@@ -71,6 +71,17 @@ jobs:
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
 
+      # Upload JUnit XML reports when tests fail so the exact failure is visible
+      # in the Artifacts tab without needing log access.
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/test-results/testDebugUnitTest/
+          retention-days: 7
+          if-no-files-found: ignore
+
       # ── 7. Build ───────────────────────────────────────────────────────────
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
