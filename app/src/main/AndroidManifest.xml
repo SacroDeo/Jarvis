@@ -10,6 +10,9 @@
          requested through the normal ActivityResultContracts.RequestPermission flow
          in ConversationScreen when the user issues an explicit call command. -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- Normal-level permission required by AlarmClock.ACTION_SET_ALARM on older APIs.
+         Automatically granted by the system; no runtime dialog needed. -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

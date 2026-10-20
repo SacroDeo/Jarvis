@@ -83,6 +83,19 @@ class ConversationRepository private constructor(private val store: Conversation
     fun historyForRequest(): List<ChatMessage> =
         messages.filter { !it.isError }.map { ChatMessage(it.role, it.text) }
 
+    /**
+     * History sanitized through [sanitize] before transmission to a remote model.
+     *
+     * [sanitize] is applied to every message's text; it should be the privacy
+     * filter's [filter] call so that phone numbers, emails, and contact names
+     * in older persisted messages are also redacted before they leave the device.
+     *
+     * The sanitized text is used only in the outgoing request; the repository's
+     * in-memory and persisted copies are left unchanged.
+     */
+    fun historyForRequest(sanitize: (String) -> String): List<ChatMessage> =
+        messages.filter { !it.isError }.map { ChatMessage(it.role, sanitize(it.text)) }
+
     suspend fun persist() {
         if (!dirty) return
         if (messages.none { !it.isError }) return

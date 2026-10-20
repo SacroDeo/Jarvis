@@ -19,10 +19,12 @@ import dk.foss.jarvis.contacts.ToolRegistry
 import dk.foss.jarvis.data.ConversationRepository
 import dk.foss.jarvis.data.JarvisSettings
 import dk.foss.jarvis.data.SettingsStore
+import dk.foss.jarvis.tools.AlarmTool
+import dk.foss.jarvis.tools.AppLaunchTool
 import dk.foss.jarvis.voice.AndroidTts
+import dk.foss.jarvis.voice.ContactAwarePrivacyFilter
 import dk.foss.jarvis.voice.ElevenLabsTts
 import dk.foss.jarvis.voice.PrivacyFilter
-import dk.foss.jarvis.voice.RegexPrivacyFilter
 import dk.foss.jarvis.voice.ScribeRecognizer
 import dk.foss.jarvis.voice.SimpleEnergyVerifier
 import dk.foss.jarvis.voice.SpeakerVerifier
@@ -89,7 +91,18 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private val main = Handler(Looper.getMainLooper())
     private var recognizer: VoiceRecognizer? = null
     private var speakerVerifier: SpeakerVerifier? = null
-    private val privacyFilter = RegexPrivacyFilter()
+    /**
+     * Privacy filter for this conversation session.
+     * [ContactAwarePrivacyFilter] loads contact display names lazily after
+     * READ_CONTACTS is granted; until then it behaves identically to the regex-only
+     * base class. The filter instance is per-ViewModel so its token counter is
+     * scoped to one conversation.
+     */
+    private val privacyFilter by lazy { ContactAwarePrivacyFilter(getApplication()) }
+
+    /** Convenience: sanitize a message text for outgoing requests. */
+    private fun sanitizeForRequest(text: String): String =
+        privacyFilter.filter(text).sanitizedText
 
     /** Run on the main thread; returns Unit so it fits expression-body callbacks. */
     private fun onMain(block: () -> Unit) { main.post(block) }
@@ -166,6 +179,23 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     // Guard against duplicate dial-intent launches from repeated callbacks or
     // recomposition. Reset by beginTurn() and cancelCallFlow().
     private var dialedThisTurn = false
+
+    // ── multi-tool orchestration state ───────────────────────────────────────
+    // Track how many model↔tool iterations have been used in the current turn.
+    // Reset by beginTurn().  Never exceeds MAX_ORCHESTRATION_STEPS.
+    private var orchestrationStep = 0
+
+    // In-flight tool-result messages accumulated during this turn.
+    // Appended to the request history for each follow-up model call so the model
+    // knows what was executed and can compose a natural final reply.
+    // Never persisted to ConversationRepository — request-only context.
+    private val turnToolResults = mutableListOf<ChatMessage>()
+
+    // Set by executeAlarmTool / executeOpenAppTool after synchronous execution;
+    // cleared by onComplete() of the main think() request before delegating to
+    // continueWithToolResult().  This allows onComplete() to act as the hand-off
+    // point between the original model request and the follow-up request.
+    private var pendingToolResultForModel: String? = null
 
     // While idle in a conversation we re-arm "Hey Jarvis" so the user can re-activate
     // by voice. Loop-breaker: if wake-triggered turns keep coming back empty, stop
@@ -318,6 +348,9 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         working.value = false
         stalled.value = false
         dialedThisTurn = false
+        orchestrationStep = 0
+        turnToolResults.clear()
+        pendingToolResultForModel = null
         // Stop any in-flight recognition so the next start isn't blocked by
         // AudioCapture's "if (active) return" guard (which silently drops it).
         runCatching { recognizer?.stop() }
@@ -354,6 +387,9 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         emptyWakeTurns = 0
         currentTurnFromWake = false
         dialedThisTurn = false
+        orchestrationStep = 0
+        turnToolResults.clear()
+        pendingToolResultForModel = null
         runCatching { recognizer?.stop() }
         cancelRunnable?.run()
         cancelRunnable = null
@@ -753,8 +789,13 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         }
         repo.addMessage("user", sanitizedText)
         // Tool-enforcement system prompt is prepended for the voice path only.
-        val requestHistory = listOf(ChatMessage("system", ToolRegistry.SYSTEM_PROMPT)) +
-            repo.historyForRequest()
+        // turnToolResults contains any tool-result context from previous iterations
+        // within this turn (empty on the first call).
+        // Re-sanitize each historical message so old persisted text and any
+        // contact names missed on the first pass are redacted before transmission.
+        val requestHistory = listOf(ChatMessage("system", ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT)) +
+            repo.historyForRequest(::sanitizeForRequest) +
+            turnToolResults
 
         val s = settings ?: return
         val client = WorkerClient(s.workerUrl, s.workerToken)
@@ -763,7 +804,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             json_schema = JsonSchemaSpec(
                 name = "assistant_envelope",
                 strict = true,
-                schema = ToolRegistry.CALL_ENVELOPE_SCHEMA,
+                schema = ToolRegistry.MULTI_TOOL_SCHEMA,
             ),
         )
         cancelRunnable = client.streamChat(
@@ -793,15 +834,23 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                         return@onMain
                     }
                     // Contact lookup is running on Dispatchers.IO.  The coroutine in
-                    // resolveAndRouteCall will drive the call-flow stages (clarification /
-                    // confirmation) when it returns.  Do not call completeStructuredTurn()
-                    // here — that would set streamDone=true, call pump() → finishTurn() →
-                    // startListening() → beginTurn() and bump turn, causing the lookup to
-                    // fail its turn guard and silently discard results.
+                    // resolveAndRouteCall will drive the call-flow stages when it returns.
                     if (callStage is CallStage.ToolLookupInProgress) {
                         main.removeCallbacks(stallIndicator)
                         working.value = false
                         stalled.value = false
+                        return@onMain
+                    }
+                    // A non-call tool (alarm, app-launch) executed synchronously in
+                    // handleStructuredContent and stored its result here.  Delegate
+                    // to a follow-up model request so it can formulate a natural reply.
+                    val pendingResult = pendingToolResultForModel
+                    if (pendingResult != null) {
+                        pendingToolResultForModel = null
+                        main.removeCallbacks(stallIndicator)
+                        working.value = false
+                        stalled.value = false
+                        continueWithToolResult(myTurn)
                         return@onMain
                     }
                     completeStructuredTurn()
@@ -866,6 +915,20 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 reply.value = outcome.ack.ifBlank { "One moment." }
                 executeCallTool(outcome.contactName, myTurn)
             }
+            is ToolRegistry.Outcome.SetAlarmCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Setting alarm…" }
+                executeAlarmTool(outcome.hour, outcome.minute, outcome.label, myTurn)
+            }
+            is ToolRegistry.Outcome.OpenAppCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Opening app…" }
+                executeOpenAppTool(outcome.appName, myTurn)
+            }
             is ToolRegistry.Outcome.Invalid -> {
                 lastOutcomeWasReply = false
                 // Fail closed: no tool execution, no speech from a malformed envelope.
@@ -906,6 +969,146 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         resolveAndRouteCall(contactName, myTurn)
+    }
+
+    /**
+     * Execute a [set_alarm] tool call synchronously.
+     *
+     * [AlarmTool.set] fires [AlarmClock.ACTION_SET_ALARM] and returns immediately.
+     * The result is stored in [turnToolResults] and [pendingToolResultForModel]
+     * so the [think] request's [onComplete] can dispatch a follow-up model call
+     * that generates a natural acknowledgement ("Your 7 AM alarm is set!").
+     *
+     * Alarm details stay entirely on-device — only a safe description string
+     * (e.g. "Alarm set for 07:00, label: Study") reaches the model.
+     */
+    private fun executeAlarmTool(hour: Int, minute: Int, label: String, myTurn: Int) {
+        if (turn != myTurn) return
+        val context = getApplication<Application>()
+        val result = AlarmTool.set(context, hour, minute, label)
+        val resultMsg = when (result) {
+            is AlarmTool.Result.Success     -> "Tool set_alarm executed: ${result.description}"
+            is AlarmTool.Result.InvalidTime -> "Tool set_alarm failed: invalid time $hour:$minute"
+            is AlarmTool.Result.Failure     -> "Tool set_alarm failed: ${result.reason}"
+        }
+        // Store result context for the follow-up model request.
+        turnToolResults.add(ChatMessage("system", resultMsg))
+        pendingToolResultForModel = resultMsg
+        // Speak a brief holding phrase so the user isn't left in silence;
+        // the model will generate the full natural response after the follow-up call.
+        if (result is AlarmTool.Result.Success) {
+            val timeStr = AlarmTool.formatTimeTts(hour, minute)
+            reply.value = "Setting alarm for $timeStr…"
+        } else {
+            reply.value = "Having trouble with that alarm…"
+        }
+    }
+
+    /**
+     * Execute an [open_app] tool call synchronously.
+     *
+     * [AppLaunchTool.open] resolves the app name against installed launchable apps,
+     * fires the launch intent, and returns immediately.  The result is fed back to
+     * the model exactly as for [executeAlarmTool].
+     *
+     * App names are limited to a short safe string; full package lists are never
+     * transmitted to the model.
+     */
+    private fun executeOpenAppTool(appName: String, myTurn: Int) {
+        if (turn != myTurn) return
+        val context = getApplication<Application>()
+        val result = AppLaunchTool.open(context, appName)
+        val resultMsg = when (result) {
+            is AppLaunchTool.Result.Success         -> "Tool open_app executed: opened ${result.appLabel}"
+            is AppLaunchTool.Result.NotFound        -> "Tool open_app failed: no app matching \"${result.query}\" found"
+            is AppLaunchTool.Result.MultipleMatches ->
+                "Tool open_app ambiguous: found multiple matches (${result.labels.take(3).joinToString(", ")}). Ask which one."
+            is AppLaunchTool.Result.Failure         -> "Tool open_app failed: ${result.reason}"
+        }
+        turnToolResults.add(ChatMessage("system", resultMsg))
+        pendingToolResultForModel = resultMsg
+        reply.value = when (result) {
+            is AppLaunchTool.Result.Success -> "Opening ${result.appLabel}…"
+            else                            -> "Having trouble opening that app…"
+        }
+    }
+
+    /**
+     * Send a follow-up model request after a non-call tool has executed.
+     *
+     * The request includes the full turn history plus the tool-result messages
+     * accumulated in [turnToolResults].  [allowTool] is `false` so the model
+     * cannot request another tool in this iteration, preventing unbounded loops.
+     *
+     * [orchestrationStep] is incremented here; if the limit is reached the
+     * model is not called again and Jarvis speaks a safe fallback.
+     */
+    private fun continueWithToolResult(myTurn: Int) {
+        if (turn != myTurn) return
+        orchestrationStep++
+        if (orchestrationStep > MAX_ORCHESTRATION_STEPS) {
+            enqueueSpeech("Done.")
+            streamDone = true
+            pump()
+            return
+        }
+
+        val s = settings ?: run {
+            enqueueSpeech("Done.")
+            streamDone = true
+            pump()
+            return
+        }
+        working.value = true
+
+        val requestHistory = listOf(ChatMessage("system", ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT)) +
+            repo.historyForRequest(::sanitizeForRequest) +
+            turnToolResults
+
+        val client = WorkerClient(s.workerUrl, s.workerToken)
+        val schema = JsonSchemaResponseFormat(
+            type = "json_schema",
+            json_schema = JsonSchemaSpec(
+                name = "assistant_envelope",
+                strict = true,
+                schema = ToolRegistry.MULTI_TOOL_SCHEMA,
+            ),
+        )
+        val myStepTurn = turn
+        cancelRunnable = client.streamChat(
+            requestHistory,
+            s.model,
+            repo.sessionId,
+            object : WorkerClient.StreamCallbacks {
+                override fun onDelta(textDelta: String) = onMain {
+                    // allowTool=false: even if the model tries a tool it becomes a Reply.
+                    if (turn == myStepTurn) handleStructuredContent(textDelta, myStepTurn, allowTool = false)
+                }
+                override fun onSessionId(id: String) { repo.setSessionId(id) }
+                override fun onComplete() = onMain {
+                    if (turn != myStepTurn) return@onMain
+                    if (error.value != null) {
+                        main.removeCallbacks(stallIndicator)
+                        working.value = false
+                        stalled.value = false
+                        return@onMain
+                    }
+                    completeStructuredTurn()
+                }
+                override fun onError(message: String) = onMain {
+                    if (turn != myStepTurn) return@onMain
+                    main.removeCallbacks(stallIndicator)
+                    working.value = false
+                    stalled.value = false
+                    // Tool already executed — don't show an error to the user;
+                    // just finish the turn with what was spoken.
+                    enqueueSpeech("Done.")
+                    streamDone = true
+                    pump()
+                }
+            },
+            responseFormat = schema,
+        )
     }
 
     /**
@@ -1007,9 +1210,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private fun roundTripReask(note: String) {
         val s = settings ?: return
         callStage = CallStage.RoundTrip
-        // System note is request-only — never persisted or added to the UI history.
-        val requestHistory = listOf(ChatMessage("system", ToolRegistry.SYSTEM_PROMPT)) +
-            repo.historyForRequest() +
+        val requestHistory = listOf(ChatMessage("system", ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT)) +
+            repo.historyForRequest(::sanitizeForRequest) +
             ChatMessage("system", "$note Answer with tool=\"none\" and ask a short question.")
         val client = WorkerClient(s.workerUrl, s.workerToken)
         val structured = JsonSchemaResponseFormat(
@@ -1017,7 +1219,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             json_schema = JsonSchemaSpec(
                 name = "assistant_envelope",
                 strict = true,
-                schema = ToolRegistry.CALL_ENVELOPE_SCHEMA,
+                schema = ToolRegistry.MULTI_TOOL_SCHEMA,
             ),
         )
         val myTurn = turn
@@ -1086,6 +1288,11 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             streamDone = true
             pump()
             return
+        }
+        // Permission just granted — load contact names for privacy filtering on a
+        // background thread so they are available for subsequent AI requests.
+        viewModelScope.launch(Dispatchers.IO) {
+            privacyFilter.ensureContactNamesLoaded()
         }
         callStage = CallStage.None
         resolveAndRouteCall(stage.query, turn)
@@ -1409,6 +1616,9 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         streamDone = false
         lastOutcomeWasReply = true
         dialedThisTurn = false
+        orchestrationStep = 0
+        turnToolResults.clear()
+        pendingToolResultForModel = null
         segments.clear()
         speakingIndex.value = -1
         pendingText.value = ""
@@ -1443,6 +1653,13 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         const val IDLE_FLUSH_MS = 350L
         const val STALL_MS = 800L
         const val WAKE_REARM_DELAY_MS = 1200L
+
+        /**
+         * Maximum number of model↔tool iterations per user turn.
+         * After this many follow-up calls the loop stops regardless of what the
+         * model requests, preventing runaway API spend.
+         */
+        const val MAX_ORCHESTRATION_STEPS = 3
 
         /**
          * How long a spoken call confirmation / clarification waits for the user's
