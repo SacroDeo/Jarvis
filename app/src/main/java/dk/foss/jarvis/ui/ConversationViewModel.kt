@@ -1000,11 +1000,12 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         if (turn != myTurn) return
         val context = getApplication<Application>()
         val result = AlarmTool.set(context, hour, minute, label)
-        val resultMsg = when (result) {
-            is AlarmTool.Result.Success     -> "Tool set_alarm executed: ${result.description}"
-            is AlarmTool.Result.InvalidTime -> "Tool set_alarm failed: invalid time $hour:$minute"
-            is AlarmTool.Result.Failure     -> "Tool set_alarm failed: ${result.reason}"
-        }
+        val resultMsg = if (result is AlarmTool.Result.Success)
+            "Tool set_alarm executed: ${result.description}"
+        else if (result is AlarmTool.Result.InvalidTime)
+            "Tool set_alarm failed: invalid time $hour:$minute"
+        else
+            "Tool set_alarm failed: ${(result as AlarmTool.Result.Failure).reason}"
         // Store result context for the follow-up model request.
         turnToolResults.add(ChatMessage("system", resultMsg))
         pendingToolResultForModel = resultMsg
@@ -1032,19 +1033,17 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         if (turn != myTurn) return
         val context = getApplication<Application>()
         val result = AppLaunchTool.open(context, appName)
-        val resultMsg = when (result) {
-            is AppLaunchTool.Result.Success         -> "Tool open_app executed: opened ${result.appLabel}"
-            is AppLaunchTool.Result.NotFound        -> "Tool open_app failed: no app matching \"${result.query}\" found"
-            is AppLaunchTool.Result.MultipleMatches ->
-                "Tool open_app ambiguous: found multiple matches (${result.labels.take(3).joinToString(", ")}). Ask which one."
-            is AppLaunchTool.Result.Failure         -> "Tool open_app failed: ${result.reason}"
-        }
+        val resultMsg = if (result is AppLaunchTool.Result.Success)
+            "Tool open_app executed: opened ${result.appLabel}"
+        else if (result is AppLaunchTool.Result.NotFound)
+            "Tool open_app failed: no app matching \"${result.query}\" found"
+        else if (result is AppLaunchTool.Result.MultipleMatches)
+            "Tool open_app ambiguous: found multiple matches (${result.labels.take(3).joinToString(", ")}). Ask which one."
+        else
+            "Tool open_app failed: ${(result as AppLaunchTool.Result.Failure).reason}"
         turnToolResults.add(ChatMessage("system", resultMsg))
         pendingToolResultForModel = resultMsg
-        reply.value = when (result) {
-            is AppLaunchTool.Result.Success -> "Opening ${result.appLabel}…"
-            else                            -> "Having trouble opening that app…"
-        }
+        reply.value = if (result is AppLaunchTool.Result.Success) "Opening ${result.appLabel}…" else "Having trouble opening that app…"
     }
 
     /**
@@ -1058,10 +1057,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         if (turn != myTurn) return
         val context = getApplication<Application>()
         val result = AlarmTool.dismissRinging(context, label.ifBlank { null })
-        val resultMsg = when (result) {
-            is AlarmTool.DismissResult.Opened  -> "Tool dismiss_alarm: ${result.note}"
-            is AlarmTool.DismissResult.Failure -> "Tool dismiss_alarm failed: ${result.reason}"
-        }
+        val resultMsg = if (result is AlarmTool.DismissResult.Opened)
+            "Tool dismiss_alarm: ${result.note}"
+        else
+            "Tool dismiss_alarm failed: ${(result as AlarmTool.DismissResult.Failure).reason}"
         turnToolResults.add(ChatMessage("system", resultMsg))
         pendingToolResultForModel = resultMsg
         reply.value = if (result is AlarmTool.DismissResult.Opened)
