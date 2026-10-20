@@ -1086,10 +1086,12 @@ class AlarmDismissShowTest {
     }
 
     @Test fun `AlarmTool formatTimeTts does not change across refactors`() {
-        assertEquals("7 AM",    AlarmTool.formatTimeTts(7, 0))
-        assertEquals("7:30 PM", AlarmTool.formatTimeTts(19, 30))
-        assertEquals("12 PM",   AlarmTool.formatTimeTts(12, 0))
-        assertEquals("12 AM",   AlarmTool.formatTimeTts(0, 0))
+        // Use fully qualified name: test file is in dk.foss.jarvis.contacts,
+        // AlarmTool is in dk.foss.jarvis.tools — different package, no import in file.
+        assertEquals("7 AM",    dk.foss.jarvis.tools.AlarmTool.formatTimeTts(7, 0))
+        assertEquals("7:30 PM", dk.foss.jarvis.tools.AlarmTool.formatTimeTts(19, 30))
+        assertEquals("12 PM",   dk.foss.jarvis.tools.AlarmTool.formatTimeTts(12, 0))
+        assertEquals("12 AM",   dk.foss.jarvis.tools.AlarmTool.formatTimeTts(0, 0))
     }
 
     @Test fun `DismissResult Opened carries an honest note`() {
