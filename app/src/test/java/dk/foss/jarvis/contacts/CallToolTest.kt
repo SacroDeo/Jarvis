@@ -427,3 +427,132 @@ class ContactResolverFuzzyMatchTest {
         assertTrue(fuzzy("Maa", "Maa")) // starts with itself — technically true, handled upstream
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTION_CALL behavior notes and device-only verification checklist
+//
+// The following behaviors are ANDROID-SPECIFIC and require a physical device
+// (or a rooted emulator with a telephony stack).  They CANNOT be covered by
+// JVM unit tests because they depend on:
+//   • android.content.pm.PackageManager.PERMISSION_GRANTED / DENIED
+//   • android.content.Context.checkSelfPermission
+//   • android.content.Context.startActivity
+//   • the Android telephony framework
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// DEVICE VERIFICATION REQUIRED:
+//
+// DC-1  CALL_PHONE already granted
+//       Say "Call Maa" with one exact contact and one number.
+//       Expected: outgoing call starts immediately, no dialer keypad shown.
+//
+// DC-2  CALL_PHONE not yet granted (first use)
+//       Say "Call Maa".  Jarvis speaks "I need permission to make phone calls."
+//       The CALL_PHONE system dialog appears.  Grant it.
+//       Expected: outgoing call starts immediately.
+//
+// DC-3  CALL_PHONE denied
+//       Say "Call Maa".  System dialog appears.  Deny it.
+//       Expected: Jarvis speaks "I can't make calls without the call permission."
+//       No call is placed.  No dialer opens.
+//
+// DC-4  CALL_PHONE permanently denied ("Don't ask again")
+//       Say "Call Maa" after permanent denial.
+//       Expected: same denial speech; no call, no dialer.
+//       (Directing the user to Settings is acceptable UX but not currently implemented.)
+//
+// DC-5  Duplicate-call guard
+//       Trigger the same voice command twice in rapid succession.
+//       Expected: exactly one call is placed.
+//
+// DC-6  Cancellation during permission dialog
+//       Tap the mic button while the CALL_PHONE dialog is showing, then grant permission.
+//       Expected: the stale permission result is ignored; no call is placed.
+//
+// DC-7  Ambiguous contact → select → call placed without extra confirmation
+//       Say "Call Rahul" when two contacts match.  Say "one".
+//       Expected: if that contact has one number, the call starts directly.
+//
+// DC-8  Contact with multiple numbers → select → call placed without extra confirmation
+//       Say "Call Dad" when Dad has mobile and home.  Say "one" (mobile).
+//       Expected: call starts immediately on the mobile number.
+//
+// DC-9  Contact not found
+//       Say "Call XYZ" for a non-existent contact.
+//       Expected: AI clarifying question, no call.
+//
+// DC-10 READ_CONTACTS not yet granted (permission chain)
+//       Say "Call Maa" before READ_CONTACTS is granted.
+//       Expected: READ_CONTACTS dialog first, then (if call command is still valid)
+//       contact resolution and dialing proceed normally.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pure-logic tests that CAN run on the JVM follow below.
+
+/**
+ * ToolRegistry validation with contact names that appear in common call commands.
+ * These names must survive both [ToolRegistry.isValidContactName] and
+ * [CallIntentDetector.extractCallTarget] so the end-to-end local fast path works.
+ */
+class CallNameValidationTest {
+
+    @Test fun `typical family names pass validation`() {
+        listOf("Maa", "Dad", "Mom", "Pappa", "Grandma", "Bhai", "Didi").forEach { name ->
+            assertTrue("'$name' should be a valid contact name",
+                ToolRegistry.isValidContactName(name))
+        }
+    }
+
+    @Test fun `multi-word family names pass validation`() {
+        listOf("Maa Ji", "Dad Sharma", "Uncle Raj", "Rahul Sharma").forEach { name ->
+            assertTrue("'$name' should be a valid contact name",
+                ToolRegistry.isValidContactName(name))
+        }
+    }
+
+    @Test fun `names with Unicode and emoji pass validation`() {
+        // Contacts are often saved with emoji — the name must still be accepted.
+        listOf("Maa \u2764\uFE0F", "Dad \uD83D\uDC4D", "Priya \u2B50").forEach { name ->
+            assertTrue("'$name' should be a valid contact name",
+                ToolRegistry.isValidContactName(name))
+        }
+    }
+
+    @Test fun `extractCallTarget and isValidContactName agree for positive cases`() {
+        // Names returned by extractCallTarget must always pass isValidContactName.
+        val cases = listOf(
+            "Call Maa" to "Maa",
+            "phone Dad" to "Dad",
+            "ring Grandma" to "Grandma",
+            "call Rahul Sharma" to "Rahul Sharma",
+            "call my mum" to "mum",
+        )
+        for ((input, expectedName) in cases) {
+            val extracted = CallIntentDetector.extractCallTarget(input)
+            assertEquals("extractCallTarget('$input')", expectedName, extracted)
+            assertTrue("isValidContactName('$expectedName')",
+                ToolRegistry.isValidContactName(extracted!!))
+        }
+    }
+
+    @Test fun `extractCallTarget never returns a phone number`() {
+        // A raw phone number must never be passed to ContactResolver as a name.
+        listOf(
+            "call 9876543210",
+            "call +919876543210",
+            "dial 987-654-3210",
+        ).forEach { input ->
+            assertNull("'$input' should not be detected as a call command",
+                CallIntentDetector.extractCallTarget(input))
+        }
+    }
+
+    @Test fun `ToolRegistry rejects phone-number-shaped contact names`() {
+        // Belt-and-suspenders: even if extractCallTarget somehow passes a number,
+        // isValidContactName must still reject it.
+        listOf("9876543210", "+919876543210", "1234567").forEach { name ->
+            assertFalse("'$name' should be rejected as a contact name",
+                ToolRegistry.isValidContactName(name))
+        }
+    }
+}

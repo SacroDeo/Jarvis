@@ -5,6 +5,11 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Lazy-requested at runtime for local contact lookup (call_contact tool only). -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- Lazy-requested at runtime: required to place a call directly via ACTION_CALL.
+         Declaring it here satisfies the PackageManager check; the runtime grant is
+         requested through the normal ActivityResultContracts.RequestPermission flow
+         in ConversationScreen when the user issues an explicit call command. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

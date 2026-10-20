@@ -104,6 +104,24 @@ fun ConversationScreen(vm: ConversationViewModel, assistTrigger: Int, onExit: ()
         }
     }
 
+    // Lazy CALL_PHONE request driven by the ViewModel's call flow.
+    // Raised only when the user has issued an explicit call command and the permission
+    // has not yet been granted.  The nonce prevents a stale result from being acted on
+    // if the user cancelled the flow (e.g. tapped the mic) before deciding.
+    var callPhoneNonce by remember { mutableStateOf(0) }
+    val callPhoneLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        vm.onCallPhonePermissionResult(granted, callPhoneNonce)
+    }
+    val callPhonePermissionRequest by vm.callPhonePermissionRequest
+    LaunchedEffect(callPhonePermissionRequest) {
+        if (callPhonePermissionRequest > 0) {
+            callPhoneNonce = callPhonePermissionRequest
+            callPhoneLauncher.launch(Manifest.permission.CALL_PHONE)
+        }
+    }
+
     LaunchedEffect(Unit) {
         vm.resetView()
         if (!hasPermission) {

@@ -53,6 +53,17 @@ private sealed class CallStage {
     /** READ_CONTACTS not yet granted; [token] matches [contactsPermissionRequest]. */
     data class PermissionWait(val token: Int, val query: String, val ack: String) : CallStage()
 
+    /**
+     * CALL_PHONE not yet granted; [token] matches [callPhonePermissionRequest].
+     * The pending [contact] and [number] are stored here so they can be dialled
+     * immediately once the user grants the permission — without a second lookup.
+     */
+    data class CallPhonePermissionWait(
+        val token: Int,
+        val contact: ContactCandidate,
+        val number: PhoneNumber,
+    ) : CallStage()
+
     /** Several contacts matched — awaiting spoken ordinal. */
     data class ClarifyContacts(val query: String, val candidates: List<ContactCandidate>) : CallStage()
 
@@ -94,6 +105,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     // ── call-flow state ────────────────────────────────────────────────────────
     // Nonce > 0 signals ConversationScreen to launch the READ_CONTACTS prompt once.
     val contactsPermissionRequest = mutableStateOf(0)
+    // Nonce > 0 signals ConversationScreen to launch the CALL_PHONE prompt once.
+    val callPhonePermissionRequest = mutableStateOf(0)
     private var callStage: CallStage = CallStage.None
     private var callFlowToken = 0
     private val callFlowTimeout = Runnable {
@@ -107,6 +120,13 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         if (callStage is CallStage.PermissionWait) {
             cancelCallFlow()
             hint.value = "No answer — cancelled."
+            goIdle()
+        }
+    }
+    private val callPhonePermissionWaitTimeout = Runnable {
+        if (callStage is CallStage.CallPhonePermissionWait) {
+            cancelCallFlow()
+            hint.value = "Call cancelled — no response."
             goIdle()
         }
     }
@@ -547,6 +567,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             }
             is CallStage.ToolLookupInProgress,
             is CallStage.PermissionWait,
+            is CallStage.CallPhonePermissionWait,
             is CallStage.RoundTrip -> {
                 // These stages own the mic separately; if speech somehow arrives here,
                 // cancel and re-route as a fresh request.
@@ -603,33 +624,110 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         executeCallTool(contactName, myTurn)
     }
 
-    /** Launch the system dialer via ACTION_DIAL — never places the call directly. */
+    /**
+     * Attempt to place a direct outgoing call.
+     *
+     * If [android.Manifest.permission.CALL_PHONE] has already been granted, the call
+     * starts immediately via [Intent.ACTION_CALL].  If it has not been granted yet, the
+     * ViewModel signals [ConversationScreen] to present the system permission dialog; the
+     * pending contact and number are stored in [CallStage.CallPhonePermissionWait] so
+     * that the call can proceed as soon as the user grants the permission.
+     *
+     * [Intent.ACTION_DIAL] is intentionally NOT used here — it only pre-fills the dialer
+     * and requires the user to press the call button manually, which is the bug this
+     * function fixes.
+     *
+     * Duplicate-launch protection: [dialedThisTurn] is set to `true` before any intent
+     * is fired (or before the permission dialog is raised) and reset only by [cancelCallFlow],
+     * [beginTurn], [resetView], and [stopAll].  A repeated callback or recomposition that
+     * calls [dial] a second time within the same turn is therefore silently dropped.
+     */
     private fun dial(contact: ContactCandidate, number: PhoneNumber) {
         // Prevent duplicate launches from repeated callbacks or recomposition.
         if (dialedThisTurn) {
             Log.w(TAG, "dial: skipping duplicate launch for turn $turn")
             return
         }
-        dialedThisTurn = true
 
         val context = getApplication<Application>()
-        val intent = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number.number, null))
+        val hasCallPermission = android.content.pm.PackageManager.PERMISSION_GRANTED ==
+            context.checkSelfPermission(android.Manifest.permission.CALL_PHONE)
+
+        if (!hasCallPermission) {
+            // Mark as in-progress now so that a second onFinal / recomposition during
+            // the permission dialog cannot start a duplicate flow.
+            dialedThisTurn = true
+            // Reset any stall state left over from the lookup phase.
+            main.removeCallbacks(stallIndicator)
+            working.value = false
+            stalled.value = false
+            val token = ++callFlowToken
+            callStage = CallStage.CallPhonePermissionWait(token, contact, number)
+            state.value = ConvState.Idle
+            hint.value = null
+            // Signal the UI to present the system CALL_PHONE permission dialog.
+            callPhonePermissionRequest.value = token
+            // Speak a rationale so the user understands why the dialog is appearing.
+            enqueueSpeech("I need permission to make phone calls. Please allow it.")
+            // streamDone=true so finishTurn() is called after the rationale; finishTurn
+            // will detect CallPhonePermissionWait and hold at Idle (not start listening).
+            streamDone = true
+            main.removeCallbacks(callPhonePermissionWaitTimeout)
+            main.postDelayed(callPhonePermissionWaitTimeout, PERMISSION_WAIT_MS)
+            pump()
+            return
+        }
+
+        dialedThisTurn = true
+        placeCall(context, contact, number)
+    }
+
+    /**
+     * Fire the [Intent.ACTION_CALL] intent and transition to idle.
+     * Must only be called after [android.Manifest.permission.CALL_PHONE] is confirmed
+     * to be granted (the caller is responsible for that check).
+     */
+    private fun placeCall(context: android.app.Application, contact: ContactCandidate, number: PhoneNumber) {
+        val intent = Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number.number, null))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching {
             context.startActivity(intent)
         }.onFailure {
-            dialedThisTurn = false // allow retry via the error speech path
-            enqueueSpeech("I couldn't open the phone app.")
+            dialedThisTurn = false // allow a retry through the error speech path
+            enqueueSpeech("Sorry, I couldn't start the call.")
             streamDone = true
             pump()
             return
         }
-        // Add a short, generic assistant acknowledgement so history is not left with a
-        // dangling user request and no assistant response. Neither the contact name nor
-        // any phone number digits are included — those stay on-device only.
-        repo.addMessage("assistant", "Okay, opening the phone app.")
+        // Add a minimal acknowledgement to close the open user turn in history.
+        // Neither the contact's name nor any digit of their phone number is included —
+        // those stay strictly on-device.
+        repo.addMessage("assistant", "Okay, calling now.")
         viewModelScope.launch { repo.persist() }
         goIdle()
+    }
+
+    /**
+     * Result of the CALL_PHONE permission prompt.
+     * [nonce] must match the token issued when the prompt was raised; a stale
+     * nonce (e.g. the user tapped the mic while the dialog was showing) is ignored.
+     */
+    fun onCallPhonePermissionResult(granted: Boolean, nonce: Int) {
+        val stage = callStage
+        if (nonce != callFlowToken || stage !is CallStage.CallPhonePermissionWait) return
+        main.removeCallbacks(callPhonePermissionWaitTimeout)
+        if (!granted) {
+            cancelCallFlow()
+            enqueueSpeech("I can't make calls without the call permission.")
+            streamDone = true
+            pump()
+            return
+        }
+        // Permission granted: reset the duplicate-dial guard and place the call.
+        callStage = CallStage.None
+        dialedThisTurn = false
+        val context = getApplication<Application>()
+        placeCall(context, stage.contact, stage.number)
     }
 
     // ──────────────────────────────────────────────────────────────────────────────
@@ -965,6 +1063,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         dialedThisTurn = false
         main.removeCallbacks(callFlowTimeout)
         main.removeCallbacks(permissionWaitTimeout)
+        main.removeCallbacks(callPhonePermissionWaitTimeout)
     }
 
     /** Arm the confirmation / clarification listening window. */
@@ -1192,10 +1291,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun finishTurn() {
-        // Permission wait: do not start listening — the system dialog owns input.
-        if (callStage is CallStage.PermissionWait) {
-            // Release the mic left over from the barge-in window opened while the
-            // rationale was spoken, so the permission dialog is not fighting for it.
+        // Permission waits: do not start listening — the system dialog owns input.
+        // Release the mic so the permission dialog is not competing for RECORD_AUDIO,
+        // and return to Idle so the user sees a clean state while the dialog is shown.
+        if (callStage is CallStage.PermissionWait || callStage is CallStage.CallPhonePermissionWait) {
             runCatching { recognizer?.stop() }
             cancelListeningWatchdog()
             cancelSilenceExit()
