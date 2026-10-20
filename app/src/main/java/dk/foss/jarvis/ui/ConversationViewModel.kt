@@ -929,6 +929,20 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 reply.value = outcome.ack.ifBlank { "Opening app…" }
                 executeOpenAppTool(outcome.appName, myTurn)
             }
+            is ToolRegistry.Outcome.DismissAlarmCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Dismissing alarm…" }
+                executeDismissAlarmTool(outcome.label, myTurn)
+            }
+            is ToolRegistry.Outcome.ShowAlarmsCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Opening alarms…" }
+                executeShowAlarmsTool(myTurn)
+            }
             is ToolRegistry.Outcome.Invalid -> {
                 lastOutcomeWasReply = false
                 // Fail closed: no tool execution, no speech from a malformed envelope.
@@ -1031,6 +1045,49 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             is AppLaunchTool.Result.Success -> "Opening ${result.appLabel}…"
             else                            -> "Having trouble opening that app…"
         }
+    }
+
+    /**
+     * Execute a [dismiss_alarm] tool call.
+     *
+     * Tries [AlarmClock.ACTION_DISMISS_ALARM] for a currently ringing alarm.
+     * This CANNOT cancel a future scheduled alarm — Android provides no public API
+     * for that.  The result message is honest about this limitation.
+     */
+    private fun executeDismissAlarmTool(label: String, myTurn: Int) {
+        if (turn != myTurn) return
+        val context = getApplication<Application>()
+        val result = AlarmTool.dismissRinging(context, label.ifBlank { null })
+        val resultMsg = when (result) {
+            is AlarmTool.DismissResult.Opened  -> "Tool dismiss_alarm: ${result.note}"
+            is AlarmTool.DismissResult.Failure -> "Tool dismiss_alarm failed: ${result.reason}"
+        }
+        turnToolResults.add(ChatMessage("system", resultMsg))
+        pendingToolResultForModel = resultMsg
+        reply.value = if (result is AlarmTool.DismissResult.Opened)
+            "Asking Clock app to dismiss ringing alarm…"
+        else
+            "Couldn't reach the Clock app…"
+    }
+
+    /**
+     * Execute a [show_alarms] tool call.
+     *
+     * Opens the Clock app's alarm list.  The user must delete any alarm manually —
+     * no public API lets an ordinary app do this for them.
+     */
+    private fun executeShowAlarmsTool(myTurn: Int) {
+        if (turn != myTurn) return
+        val context = getApplication<Application>()
+        val opened = AlarmTool.showAlarms(context)
+        val resultMsg = if (opened)
+            "Tool show_alarms: Clock app opened. User must delete the alarm manually — " +
+            "apps cannot programmatically cancel scheduled alarms without Accessibility Service."
+        else
+            "Tool show_alarms failed: no Clock app found."
+        turnToolResults.add(ChatMessage("system", resultMsg))
+        pendingToolResultForModel = resultMsg
+        reply.value = if (opened) "Opening your alarm list…" else "Couldn't open Clock app…"
     }
 
     /**
@@ -1672,11 +1729,17 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
         /**
          * Backoff before re-opening the barge-in recognition window after a session ends
-         * or errors while Jarvis is speaking.  Long enough for a cancelling
-         * SpeechRecognizer to release the mic (so the restart does not immediately hit
-         * ERROR_RECOGNIZER_BUSY), short enough that repeated interruptions feel instant.
+         * or errors while Jarvis is speaking.
+         *
+         * INCREASED from 300ms to 1200ms (Phase 9 fix for Realme 8 audio glitch):
+         * On devices with slower audio-focus acquisition (e.g. Realme 8 / ColorOS 11),
+         * the 300ms interval was too tight. SpeechRecognizer.startListening() failed with
+         * ERROR_AUDIO or ERROR_RECOGNIZER_BUSY on every cycle while TTS held audio focus,
+         * causing audible clicks or stuttering at 300ms intervals.  1200ms still allows
+         * interruption within a sentence-length window while dramatically reducing
+         * the audio-conflict cycling frequency.
          */
-        const val BARGE_IN_REARM_MS = 300L
+        const val BARGE_IN_REARM_MS = 1200L
 
         /**
          * Ceiling on barge-in re-arms within one reply.  A healthy recogniser needs one

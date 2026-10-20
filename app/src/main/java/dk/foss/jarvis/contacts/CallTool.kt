@@ -51,6 +51,8 @@ object ToolRegistry {
     const val TOOL_CALL_CONTACT  = "call_contact"
     const val TOOL_SET_ALARM     = "set_alarm"
     const val TOOL_OPEN_APP      = "open_app"
+    const val TOOL_DISMISS_ALARM = "dismiss_alarm"
+    const val TOOL_SHOW_ALARMS   = "show_alarms"
 
     private const val MAX_CONTACT_NAME_LEN   = 60
     private const val MAX_CONTACT_NAME_DIGITS = 6
@@ -73,6 +75,7 @@ object ToolRegistry {
                 putJsonArray("enum") {
                     add(TOOL_NONE); add(TOOL_CALL_CONTACT)
                     add(TOOL_SET_ALARM); add(TOOL_OPEN_APP)
+                    add(TOOL_DISMISS_ALARM); add(TOOL_SHOW_ALARMS)
                 }
             }
             putJsonObject("contact_name") { put("type", "string") }
@@ -106,24 +109,29 @@ object ToolRegistry {
         You are Jarvis, a personal voice assistant running on an Android phone.
 
         You can perform these actions:
-        • call_contact — start a phone call to a named person
-        • set_alarm    — set a timed alarm or reminder
-        • open_app     — open an installed Android application
-        • none         — reply conversationally without taking an action
+        • call_contact  — start a phone call to a named person
+        • set_alarm     — set a timed alarm or reminder
+        • dismiss_alarm — dismiss a currently ringing alarm (cannot cancel future alarms)
+        • show_alarms   — open the Clock app so the user can view and delete alarms
+        • open_app      — open an installed Android application
+        • none          — reply conversationally without taking an action
 
         Always respond with a single JSON object containing ALL of these fields:
           "reply"        — short spoken sentence (always required)
-          "tool"         — one of the four values above
+          "tool"         — one of the six values above
           "contact_name" — the contact's name (call_contact only, else "")
           "alarm_hour"   — hour 0–23 as an integer (set_alarm only, else 0)
           "alarm_minute" — minute 0–59 as an integer (set_alarm only, else 0)
-          "alarm_label"  — alarm description (set_alarm only, else "")
+          "alarm_label"  — alarm description (set_alarm or dismiss_alarm only, else "")
           "app_name"     — app name to open (open_app only, else "")
 
         Rules:
         - Use call_contact only when the user explicitly wants to phone a specific person.
         - Use set_alarm only when a time is clearly specified; if the time is missing, ask
           for it in reply and set tool to "none".
+        - Use dismiss_alarm when the user says to stop/turn off/cancel an alarm. It only
+          works for currently ringing alarms. For future alarms, use show_alarms instead.
+        - Use show_alarms when the user wants to see, manage, or delete a scheduled alarm.
         - Use open_app only when the user wants to launch an app.
         - For all other requests use tool "none" and reply conversationally.
         - Phone numbers and contact details never appear in your output — the device
@@ -159,6 +167,12 @@ object ToolRegistry {
 
         /** Model wants to open an app. */
         data class OpenAppCall(val appName: String, val ack: String) : Outcome()
+
+        /** Model wants to dismiss a currently ringing alarm. */
+        data class DismissAlarmCall(val label: String, val ack: String) : Outcome()
+
+        /** Model wants to show the alarm list so the user can manage alarms. */
+        data class ShowAlarmsCall(val ack: String) : Outcome()
 
         /** Malformed / policy-violating response — fail closed. */
         object Invalid : Outcome()
@@ -215,6 +229,19 @@ object ToolRegistry {
             if (appName.isEmpty() || appName.length > MAX_APP_NAME_LEN) return Outcome.Invalid
             if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
             return Outcome.OpenAppCall(appName = appName, ack = reply)
+        }
+
+        // ── dismiss_alarm ─────────────────────────────────────────────────────
+        if (tool == TOOL_DISMISS_ALARM) {
+            if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
+            val label = envelope.alarm_label.trim() // optional — may be empty
+            return Outcome.DismissAlarmCall(label = label, ack = reply)
+        }
+
+        // ── show_alarms ───────────────────────────────────────────────────────
+        if (tool == TOOL_SHOW_ALARMS) {
+            if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
+            return Outcome.ShowAlarmsCall(ack = reply)
         }
 
         // Unknown tool — fail closed.

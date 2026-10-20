@@ -7,18 +7,27 @@ import android.provider.AlarmClock
 import android.util.Log
 
 /**
- * Executes a "set alarm/reminder" action by delegating to the system Clock app
- * via [AlarmClock.ACTION_SET_ALARM].
+ * Executes alarm-related actions by delegating to the system Clock app
+ * via [AlarmClock] intents.
  *
- * No special Android permission is required — the Clock app owns the alarm data
- * and handles it internally.  [android.permission.SET_ALARM] is a normal-level
- * permission declared in the manifest as a precaution on older API levels.
+ * **What Android actually supports (and what we honestly report):**
  *
- * Implementation notes:
- * - [AlarmClock.EXTRA_SKIP_UI] = true sets the alarm silently (best experience).
- * - If the device's Clock app does not support SKIP_UI, the intent still works
- *   but opens the Clock UI pre-filled; [ActivityNotFoundException] is NOT thrown.
- * - Phone numbers, contact names, and other private data are never passed here.
+ * SET:     [AlarmClock.ACTION_SET_ALARM] — asks the Clock app to create an alarm.
+ *          EXTRA_SKIP_UI=true requests silent creation; some OEM Clocks show UI anyway.
+ *          `startActivity()` returning without exception means the intent was accepted —
+ *          NOT that the alarm was definitely saved.  We are honest about this.
+ *
+ * DISMISS: [AlarmClock.ACTION_DISMISS_ALARM] (API 23+) — dismisses an alarm that is
+ *          CURRENTLY RINGING.  This CANNOT delete a scheduled future alarm.
+ *          No public Android API allows an ordinary app to delete future alarms.
+ *
+ * SHOW:    [AlarmClock.ACTION_SHOW_ALARMS] — opens the Clock app's alarm list so
+ *          the user can review and delete alarms themselves.  This is the only
+ *          reliable way to cancel a future alarm from outside the Clock app.
+ *
+ * No special Android permissions are required for these intents.
+ * [com.android.alarm.permission.SET_ALARM] is declared in the manifest as a
+ * normal-level permission for pre-API-23 compatibility (auto-granted by the system).
  */
 object AlarmTool {
 
@@ -31,13 +40,10 @@ object AlarmTool {
     }
 
     /**
-     * Set an alarm for [hour]:[minute] with optional [label].
+     * Request the Clock app to set an alarm for [hour]:[minute] with [label].
      *
-     * @param context  Application context (never leaks to the model).
-     * @param hour     Hour in 24-hour format (0–23).
-     * @param minute   Minute (0–59).
-     * @param label    Human-readable alarm label shown by the Clock app.
-     * @return         [Result.Success] with a log-safe description, or an error subtype.
+     * Returns [Result.Success] when the intent was accepted by the system.
+     * This does NOT confirm the alarm was saved — see class KDoc.
      */
     fun set(context: Context, hour: Int, minute: Int, label: String): Result {
         if (hour !in 0..23 || minute !in 0..59) {
@@ -57,9 +63,6 @@ object AlarmTool {
         return try {
             context.startActivity(intent)
             val timeStr = "%02d:%02d".format(hour, minute)
-            // Note: startActivity returning without an exception means the Clock app
-            // received the intent.  It does NOT confirm that the alarm was actually saved —
-            // some OEM Clock apps open a confirmation screen even when EXTRA_SKIP_UI=true.
             val desc = "Alarm intent sent to Clock app for $timeStr (label: $effectiveLabel). " +
                 "Android cannot confirm the alarm was saved without user interaction."
             Log.i(TAG, "ACTION_SET_ALARM sent for $timeStr label=$effectiveLabel")
@@ -73,6 +76,77 @@ object AlarmTool {
         } catch (e: Exception) {
             Log.w(TAG, "Unexpected error setting alarm", e)
             Result.Failure("Could not set alarm.")
+        }
+    }
+
+    /**
+     * Attempt to dismiss an alarm that is currently ringing.
+     *
+     * [AlarmClock.ACTION_DISMISS_ALARM] (API 23+) only works for alarms that
+     * are actively ringing or snoozed at the moment of the call.  It CANNOT
+     * cancel or delete a scheduled future alarm.
+     *
+     * If [label] is provided, the search is narrowed to alarms with that label.
+     * If null, the intent tries to dismiss any currently ringing alarm.
+     *
+     * Returns [DismissResult.Opened] if the intent was accepted (alarm may be
+     * dismissed or the Clock UI may open), or [DismissResult.Failure] on error.
+     */
+    sealed class DismissResult {
+        /** Intent accepted. The ringing alarm may have been dismissed, or the Clock UI opened. */
+        data class Opened(val note: String) : DismissResult()
+        /** Intent was not handled — no ringing alarm found, or no Clock app. */
+        data class Failure(val reason: String) : DismissResult()
+    }
+
+    fun dismissRinging(context: Context, label: String? = null): DismissResult {
+        val intent = Intent(AlarmClock.ACTION_DISMISS_ALARM).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            // ALARM_SEARCH_MODE_LABEL narrows to alarms with the given label.
+            // When label is null we use ALL mode to catch any ringing alarm.
+            if (!label.isNullOrBlank()) {
+                putExtra(AlarmClock.EXTRA_ALARM_SEARCH_MODE, AlarmClock.ALARM_SEARCH_MODE_LABEL)
+                putExtra(AlarmClock.EXTRA_MESSAGE, label)
+            } else {
+                putExtra(AlarmClock.EXTRA_ALARM_SEARCH_MODE, AlarmClock.ALARM_SEARCH_MODE_ALL)
+            }
+        }
+        return try {
+            context.startActivity(intent)
+            Log.i(TAG, "ACTION_DISMISS_ALARM sent (label=$label)")
+            DismissResult.Opened(
+                "Dismiss request sent to Clock app. This only works for an alarm that is " +
+                "currently ringing or snoozed — it cannot cancel a future scheduled alarm."
+            )
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "No Clock app to handle ACTION_DISMISS_ALARM", e)
+            DismissResult.Failure("No clock application found to dismiss the alarm.")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error dismissing alarm", e)
+            DismissResult.Failure("Could not dismiss alarm.")
+        }
+    }
+
+    /**
+     * Open the Clock app's alarm list so the user can view and manage their alarms.
+     *
+     * This is the only reliable way for an app to help a user cancel a future
+     * alarm without Accessibility Service access.
+     */
+    fun showAlarms(context: Context): Boolean {
+        val intent = Intent(AlarmClock.ACTION_SHOW_ALARMS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return try {
+            context.startActivity(intent)
+            Log.i(TAG, "ACTION_SHOW_ALARMS sent")
+            true
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "No Clock app to handle ACTION_SHOW_ALARMS", e)
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Error showing alarms", e)
+            false
         }
     }
 

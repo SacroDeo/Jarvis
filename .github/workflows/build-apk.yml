@@ -64,7 +64,14 @@ jobs:
             >> gradle.properties
           echo 'org.gradle.daemon=false' >> gradle.properties
 
-      # ── 6. Build ───────────────────────────────────────────────────────────
+      # ── 6. Unit tests ──────────────────────────────────────────────────────
+      # Run the JVM unit-test suite before assembling the APK so that a test
+      # regression is reported as a test failure, not buried in a build log.
+      # The heap override from step 5 is already active for this task.
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+
+      # ── 7. Build ───────────────────────────────────────────────────────────
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 

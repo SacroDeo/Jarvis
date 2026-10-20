@@ -210,6 +210,40 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             finishStream()
                         }
 
+                        is ToolRegistry.Outcome.DismissAlarmCall -> {
+                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
+                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
+                                finishStream(); return@onMain
+                            }
+                            orchestrationStep++; toolExecutedThisTurn = true
+                            val context = getApplication<Application>()
+                            val res = AlarmTool.dismissRinging(context, outcome.label.ifBlank { null })
+                            val msg = when (res) {
+                                is AlarmTool.DismissResult.Opened  -> "Tool dismiss_alarm: ${res.note}"
+                                is AlarmTool.DismissResult.Failure -> "Tool dismiss_alarm failed: ${res.reason}"
+                            }
+                            turnToolResults.add(ChatMessage("system", msg))
+                            responseBuffer.clear()
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
+                        }
+
+                        is ToolRegistry.Outcome.ShowAlarmsCall -> {
+                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
+                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
+                                finishStream(); return@onMain
+                            }
+                            orchestrationStep++; toolExecutedThisTurn = true
+                            val context = getApplication<Application>()
+                            val opened = AlarmTool.showAlarms(context)
+                            val msg = if (opened)
+                                "Tool show_alarms: Clock app opened. User must delete alarm manually."
+                            else
+                                "Tool show_alarms failed: no Clock app found."
+                            turnToolResults.add(ChatMessage("system", msg))
+                            responseBuffer.clear()
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
+                        }
+
                         is ToolRegistry.Outcome.Invalid -> {
                             // Malformed response — show a safe error.
                             val msg = "⚠️ I had trouble understanding my own response. Please try again."
