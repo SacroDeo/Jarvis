@@ -5,12 +5,9 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -298,12 +295,9 @@ private fun AnimatedStateLabel(state: ConvState, stalled: Boolean) {
         ConvState.Thinking  -> (if (stalled) "WORKING…" else "THINKING") to JarvisColors.ThinkBlue
         ConvState.Speaking  -> "SPEAKING" to JarvisColors.Blue
     }
-    val textColor by animateColorAsState(
-        targetValue = if (state == ConvState.Thinking && stalled) JarvisColors.Muted else color,
-        animationSpec = tween(400),
-        label = "stateColor",
-    )
-    StatusTag(label, textColor)
+    // Use color directly — avoids animateColorAsState which requires compose-animation
+    // on the compile classpath (may not be transitively available in all configurations).
+    StatusTag(label, color)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -369,11 +363,9 @@ private fun StateOrb(state: ConvState, working: Boolean) {
         ConvState.Speaking  -> JarvisColors.Blue.copy(alpha = 0.30f)
     }
 
-    val animOrbSize by animateFloatAsState(
-        targetValue = orbSize.value,
-        animationSpec = tween(300, easing = FastOutSlowInEasing),
-        label = "orbSize",
-    )
+    // Use orbSize.value directly — avoids animateFloatAsState (same reason as AnimatedStateLabel).
+    // The pulse-ring scale animation already provides visual feedback for state changes.
+    val animOrbSize = orbSize.value
 
     Box(contentAlignment = Alignment.Center) {
         // Outer ring pulse
