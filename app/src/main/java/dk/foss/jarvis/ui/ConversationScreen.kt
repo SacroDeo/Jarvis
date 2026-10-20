@@ -4,16 +4,17 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
+
+// Note: compose-animation (AnimatedContent, fadeIn, fadeOut, togetherWith) is deliberately
+// not used here. Only animation-core is used, matching the dependency set from Phase 8
+// which compiled successfully. The compose-animation:animation module may have
+// Compose-compiler-1.5.10 compatibility constraints.
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -480,12 +481,11 @@ private fun ContextArea(
     pendingText: String,
     listState: androidx.compose.foundation.lazy.LazyListState,
 ) {
-    AnimatedContent(
-        targetState = state,
-        transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) },
-        label = "contextAnim",
-    ) { s ->
-        when (s) {
+    // Direct state display — no AnimatedContent to keep compose-animation dependency out.
+    // The per-state content switches without a cross-fade; the orb animation still provides
+    // smooth visual feedback for state transitions.
+    Box(modifier = Modifier.fillMaxWidth()) {
+        when (state) {
             ConvState.Idle -> IdleHint(hint)
 
             ConvState.Listening -> if (transcript.isNotEmpty()) {
