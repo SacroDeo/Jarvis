@@ -93,4 +93,8 @@ dependencies {
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.18.0'
 
     debugImplementation 'androidx.compose.ui:ui-tooling'
+
+    // Unit-test dependencies — JVM-only, no device required.
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2'
 }

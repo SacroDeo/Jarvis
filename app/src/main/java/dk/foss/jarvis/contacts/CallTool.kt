@@ -121,7 +121,7 @@ object ToolRegistry {
         }
     }
 
-    private fun isValidContactName(name: String): Boolean {
+    fun isValidContactName(name: String): Boolean {
         if (name.isEmpty() || name.length > MAX_CONTACT_NAME_LEN) return false
         if (name.any { it.isISOControl() }) return false
         if (name.count { it.isDigit() } > MAX_CONTACT_NAME_DIGITS) return false
@@ -140,6 +140,102 @@ object ToolRegistry {
             c = ""
         }
         return c
+    }
+}
+
+/**
+ * Detects explicit voice call intents from user speech WITHOUT an AI roundtrip.
+ *
+ * Recognises clear patterns like "call Maa", "phone Dad", "dial office",
+ * "ring Rahul", "call my mom", etc. Returns only the bare contact name.
+ *
+ * This is intentionally conservative: it only fires on utterances that
+ * unambiguously mean "initiate a phone call to <name>".  Anything that
+ * could be a question, a vague request, or a multi-word sentence with
+ * context after the name is NOT matched and falls through to the AI.
+ *
+ * All validation uses the same rules as [ToolRegistry.isValidContactName]
+ * so the extracted name is safe to pass directly to [ContactResolver].
+ */
+object CallIntentDetector {
+
+    // Recognised call-initiating verb phrases (lowercase).
+    private val CALL_PREFIXES = listOf(
+        "call ",
+        "phone ",
+        "dial ",
+        "ring ",
+        "call up ",
+        "place a call to ",
+        "make a call to ",
+        "please call ",
+        "can you call ",
+        "could you call ",
+        "i want to call ",
+        "i'd like to call ",
+        "i want you to call ",
+    )
+
+    // "my", "the" are stripped when they precede a contact name so that
+    // "call my mum" → "mum" and "ring the office" → "office".
+    private val NAME_LEAD_STRIPS = listOf("my ", "the ")
+
+    // Words that indicate the utterance is more than just a call command
+    // (e.g. "call dad about the meeting"). If the extracted name CONTAINS
+    // any of these as a word boundary, the match is rejected and the
+    // utterance falls through to the AI.
+    private val STOP_WORDS = setOf(
+        "about", "regarding", "for", "to", "because", "and", "but",
+        "when", "after", "before", "if", "since", "while", "as",
+        "on", "in", "at", "from", "with", "without",
+    )
+
+    /**
+     * Extract the intended contact name from [text].
+     *
+     * Returns the trimmed name string, or null when the text does not
+     * match a recognised call pattern or the extracted name fails validation.
+     */
+    fun extractCallTarget(text: String): String? {
+        val trimmed = text.trim()
+        if (trimmed.isBlank()) return null
+
+        val lower = trimmed.lowercase()
+        for (prefix in CALL_PREFIXES) {
+            if (lower.startsWith(prefix) && lower.length > prefix.length) {
+                var name = trimmed.substring(prefix.length)
+                    .trimEnd('.', '!', '?', ',', ';', ':')
+                    .trim()
+                if (name.isBlank()) return null
+
+                // Strip leading "my ", "the " etc.
+                val lName = name.lowercase()
+                for (strip in NAME_LEAD_STRIPS) {
+                    if (lName.startsWith(strip) && lName.length > strip.length) {
+                        name = name.substring(strip.length).trim()
+                        break
+                    }
+                }
+                if (name.isBlank()) return null
+
+                // Reject if the name contains a stop-word at a word boundary
+                // (indicates the utterance has trailing context, not a bare name).
+                val nameWords = name.lowercase().split(Regex("\\s+"))
+                if (nameWords.size > 1) {
+                    // First word is a stop-word → the name itself is a preposition or
+                    // conjunction, not a person's name (e.g. "call before the meeting",
+                    // "call on the way", "call at 5 pm").
+                    if (nameWords[0] in STOP_WORDS) return null
+                    // A stop-word at position 1+ means the user appended context after
+                    // the name (e.g. "call dad about the meeting", "call Priya for the project").
+                    if (nameWords.drop(1).any { it in STOP_WORDS }) return null
+                }
+
+                if (!ToolRegistry.isValidContactName(name)) return null
+                return name
+            }
+        }
+        return null
     }
 }
 

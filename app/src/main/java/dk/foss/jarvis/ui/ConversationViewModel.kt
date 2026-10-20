@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dk.foss.jarvis.contacts.CallFlowPolicy
+import dk.foss.jarvis.contacts.CallIntentDetector
 import dk.foss.jarvis.contacts.ContactCandidate
 import dk.foss.jarvis.contacts.ContactResolver
 import dk.foss.jarvis.contacts.LookupResult
@@ -141,6 +142,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     // True when the current structured response was a plain reply (persist it);
     // false for tool calls (their prompts are UI-only and must not enter history).
     private var lastOutcomeWasReply = true
+
+    // Guard against duplicate dial-intent launches from repeated callbacks or
+    // recomposition. Reset by beginTurn() and cancelCallFlow().
+    private var dialedThisTurn = false
 
     // While idle in a conversation we re-arm "Hey Jarvis" so the user can re-activate
     // by voice. Loop-breaker: if wake-triggered turns keep coming back empty, stop
@@ -292,6 +297,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         bargeInRearmsThisTurn = 0
         working.value = false
         stalled.value = false
+        dialedThisTurn = false
         // Stop any in-flight recognition so the next start isn't blocked by
         // AudioCapture's "if (active) return" guard (which silently drops it).
         runCatching { recognizer?.stop() }
@@ -327,6 +333,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         cancelListeningWatchdog()
         emptyWakeTurns = 0
         currentTurnFromWake = false
+        dialedThisTurn = false
         runCatching { recognizer?.stop() }
         cancelRunnable?.run()
         cancelRunnable = null
@@ -475,8 +482,16 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Dispatch a recognised answer while a call stage (or normal conversation) is
-     * active. Clarification answers are matched locally; anything unclear cancels the
-     * call flow and falls back to a normal LLM turn.
+     * active.
+     *
+     * **Local fast path (Case A):** When [callStage] is [CallStage.None] and the
+     * utterance matches a clear "call/phone/dial <name>" pattern, the contact is
+     * resolved on-device and the dialer is launched without an AI roundtrip.  This
+     * eliminates the spurious voice-confirmation step that occurred when the model
+     * chose `tool: "none"` and spoke a clarifying question instead of acting.
+     *
+     * Clarification answers are matched locally; anything unclear cancels the call
+     * flow and falls back to a normal LLM turn.
      * Exact unique matches are dialled immediately without a yes/no confirmation step.
      */
     private fun handleCallStageAnswer(text: String) {
@@ -538,18 +553,72 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 cancelCallFlow()
                 think(text)
             }
-            is CallStage.None -> think(text)
+            is CallStage.None -> {
+                // ── Local fast path ────────────────────────────────────────────
+                // Detect "call/phone/dial <name>" without an AI roundtrip.
+                // This is the primary fix: the AI previously returned tool:"none" with
+                // a clarifying question instead of tool:"call_contact", causing a
+                // spoken confirmation step the user had to answer verbally.
+                val callTarget = CallIntentDetector.extractCallTarget(text)
+                if (callTarget != null) {
+                    startLocalCallFlow(callTarget, text)
+                } else {
+                    think(text)
+                }
+            }
         }
+    }
+
+    /**
+     * Local fast path for explicit call commands ("call Maa", "phone Dad", …).
+     *
+     * Sets up turn/state exactly as [think] would, then calls [executeCallTool]
+     * directly — no AI request, no JSON parsing, no confirmation question from the
+     * model.  [ContactResolver] runs on [Dispatchers.IO] and the result drives the
+     * same clarification / dial machinery as the AI path.
+     *
+     * If the contact is not found (e.g. the extracted name was wrong), the
+     * [roundTripReask] machinery sends a follow-up AI request so the conversation
+     * can still recover gracefully.
+     */
+    private fun startLocalCallFlow(contactName: String, rawText: String) {
+        val myTurn = turn
+        emptyWakeTurns = 0
+        cancelCallFlow()
+        cancelListeningWatchdog()
+        hint.value = null
+        state.value = ConvState.Thinking
+        working.value = true
+        main.postDelayed(stallIndicator, STALL_MS)
+
+        val filterResult = privacyFilter.filter(rawText)
+        val sanitizedText = filterResult.sanitizedText
+        if (filterResult.detectedTypes.isNotEmpty()) {
+            hint.value = "Filtered: ${filterResult.detectedTypes.joinToString(", ")}"
+        }
+        // Add the user's utterance to history so the round-trip re-ask (if needed)
+        // has proper context.  Phone numbers never appear here — they stay on-device.
+        repo.addMessage("user", sanitizedText)
+
+        executeCallTool(contactName, myTurn)
     }
 
     /** Launch the system dialer via ACTION_DIAL — never places the call directly. */
     private fun dial(contact: ContactCandidate, number: PhoneNumber) {
+        // Prevent duplicate launches from repeated callbacks or recomposition.
+        if (dialedThisTurn) {
+            Log.w(TAG, "dial: skipping duplicate launch for turn $turn")
+            return
+        }
+        dialedThisTurn = true
+
         val context = getApplication<Application>()
         val intent = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number.number, null))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching {
             context.startActivity(intent)
         }.onFailure {
+            dialedThisTurn = false // allow retry via the error speech path
             enqueueSpeech("I couldn't open the phone app.")
             streamDone = true
             pump()
@@ -722,6 +791,12 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         val granted = android.content.pm.PackageManager.PERMISSION_GRANTED ==
             getApplication<Application>().checkSelfPermission(android.Manifest.permission.READ_CONTACTS)
         if (!granted) {
+            // Reset working state now: for the local fast path no AI onComplete will fire to
+            // do this, and the stall-indicator runnable must not fire while the permission
+            // dialog is showing (state will be Idle, not Thinking).
+            main.removeCallbacks(stallIndicator)
+            working.value = false
+            stalled.value = false
             val token = ++callFlowToken
             callStage = CallStage.PermissionWait(token, contactName, reply.value)
             state.value = ConvState.Idle
@@ -748,6 +823,12 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
      * - [LookupResult.NotFound]       — nothing found; round-trip LLM reask.
      *
      * The ContentProvider query runs on [Dispatchers.IO]; all UI mutations resume on Main.
+     *
+     * **working/stalled reset:** [working] is always reset here, immediately after the IO
+     * lookup returns, regardless of which code path triggered this function (AI path via
+     * [think] or local fast path via [startLocalCallFlow]).  This prevents [working]
+     * from staying true indefinitely when the local path is used and [onComplete] is
+     * never called.
      */
     private fun resolveAndRouteCall(contactName: String, myTurn: Int) {
         if (turn != myTurn) return
@@ -759,6 +840,14 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 ContactResolver.lookup(context, contactName)
             }
             if (turn != myTurn || callFlowToken != myToken) return@launch
+
+            // Always reset the working/stall indicators once the IO returns.
+            // For the AI path this may be a no-op (onComplete already cleared them);
+            // for the local fast path this is the only place they are cleared.
+            main.removeCallbacks(stallIndicator)
+            working.value = false
+            stalled.value = false
+
             when (result) {
                 is LookupResult.ExactUnique -> {
                     val contact = result.contact
@@ -770,7 +859,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                             pump()
                         }
                         contact.numbers.size == 1 -> {
-                            // Single exact match, single number — dial without extra confirmation.
+                            // Single exact match, single number — dial immediately, no extra
+                            // confirmation required.
                             cancelCallFlow()
                             dial(contact, contact.numbers[0])
                         }
@@ -872,6 +962,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private fun cancelCallFlow() {
         callFlowToken++
         callStage = CallStage.None
+        dialedThisTurn = false
         main.removeCallbacks(callFlowTimeout)
         main.removeCallbacks(permissionWaitTimeout)
     }
@@ -1030,8 +1121,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
         recognizer?.start(languageTag = null, listener = object : VoiceRecognizer.Listener {
             override fun onSpeechStart() = onMain {
-                // Someone started talking while Jarvis speaks.  Refresh the watchdog so a
-                // long interruption is never cut off, and cancel any pending auto-exit.
+                // Someone started talking while Jarvis speaks.  Refresh the watchdog so
+                // long interruptions are never cut off, and cancel any pending auto-exit.
                 if (turn != myTurn) return@onMain
                 sawSpeech = true
                 cancelSilenceExit()
@@ -1218,6 +1309,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         speaking = false
         streamDone = false
         lastOutcomeWasReply = true
+        dialedThisTurn = false
         segments.clear()
         speakingIndex.value = -1
         pendingText.value = ""

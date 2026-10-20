@@ -55,7 +55,9 @@ object ContactResolver {
     private const val TAG = "ContactResolver"
 
     private const val MAX_RESULTS = 5
-    private const val MAX_SCANNED_ROWS = 40
+    // Secondary in-memory cap applied after the SQL LIKE filter.  Far lower than the
+    // total contacts count; the LIKE pre-filter already narrows results significantly.
+    private const val MAX_SCANNED_ROWS = 200
     private const val MAX_NUMBERS_PER_CONTACT = 4
 
     /**
@@ -90,8 +92,9 @@ object ContactResolver {
                     ContactsContract.Contacts._ID,
                     ContactsContract.Contacts.DISPLAY_NAME,
                 ),
-                null,
-                null,
+                // Filter at the database level to avoid iterating all contacts.
+                "${ContactsContract.Contacts.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$q%"),
                 null,
             )?.use { cursor ->
                 val idIdx = cursor.getColumnIndex(ContactsContract.Contacts._ID)
@@ -192,6 +195,10 @@ object ContactResolver {
     /**
      * Structured lookup distinguishing exact from approximate matches.
      *
+     * Uses a SQL LIKE pre-filter (`%query%`) so only plausibly-matching rows are
+     * loaded from the ContentProvider; this avoids the previous hard cap of 40 rows
+     * that silently failed on phones with many contacts.
+     *
      * Exact — trimmed display name == query (case-insensitive).
      * Fuzzy — display name starts with query, query starts with display name, or any
      *         word in the display name starts with query (prefix-only; no substring).
@@ -208,15 +215,19 @@ object ContactResolver {
         val fuzzyPairs = mutableListOf<Pair<Long, String>>()
 
         try {
+            // The LIKE '%q%' filter at the database level means we only iterate rows
+            // that contain the query string, dramatically reducing in-memory work
+            // compared to scanning all contacts.  The secondary MAX_SCANNED_ROWS cap
+            // is kept as a safety valve against pathological data.
             context.contentResolver.query(
                 ContactsContract.Contacts.CONTENT_URI,
                 arrayOf(
                     ContactsContract.Contacts._ID,
                     ContactsContract.Contacts.DISPLAY_NAME,
                 ),
-                null,
-                null,
-                null,
+                "${ContactsContract.Contacts.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$q%"),
+                "${ContactsContract.Contacts.DISPLAY_NAME} ASC",
             )?.use { cursor ->
                 val idIdx   = cursor.getColumnIndex(ContactsContract.Contacts._ID)
                 val nameIdx = cursor.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
@@ -241,6 +252,15 @@ object ContactResolver {
             return LookupResult.NotFound
         }
 
+        // For the reverse-prefix fuzzy case (query starts with a display name that is
+        // NOT a substring of itself), we need a second scan limited to short names.
+        // E.g. the user says "Maaji" but the contact is "Maa".  The LIKE '%Maaji%'
+        // filter above would miss "Maa" entirely.  Run a narrow supplemental query
+        // only when the primary scan found no exact matches and the query is short.
+        if (exactPairs.isEmpty() && q.length <= 20) {
+            tryReversePrefixScan(context, q, fuzzyPairs)
+        }
+
         fun load(pairs: List<Pair<Long, String>>): List<ContactCandidate> =
             pairs.map { (id, name) -> ContactCandidate(id, name, loadNumbers(context, id)) }
 
@@ -249,6 +269,58 @@ object ContactResolver {
             exactPairs.size > 1   -> LookupResult.ExactAmbiguous(load(exactPairs.take(MAX_RESULTS)))
             fuzzyPairs.isNotEmpty() -> LookupResult.FuzzyMatches(load(fuzzyPairs))
             else -> LookupResult.NotFound
+        }
+    }
+
+    /**
+     * Supplemental pass for the "query starts with display name" fuzzy arm.
+     *
+     * Example: user says "Maaji" but the contact is saved as "Maa". The primary
+     * LIKE '%Maaji%' scan misses "Maa". This pass queries contacts whose names
+     * START with the first two characters of the query to cheaply catch short-name
+     * contacts that may be a prefix of the query.
+     *
+     * Results are de-duplicated against what is already in [fuzzyPairs] by contactId.
+     */
+    private fun tryReversePrefixScan(
+        context: Context,
+        query: String,
+        fuzzyPairs: MutableList<Pair<Long, String>>,
+    ) {
+        if (query.length < FUZZY_MIN_LEN) return
+        val existingIds = fuzzyPairs.map { it.first }.toHashSet()
+        val prefix2 = query.take(2)
+        try {
+            context.contentResolver.query(
+                ContactsContract.Contacts.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.Contacts._ID,
+                    ContactsContract.Contacts.DISPLAY_NAME,
+                ),
+                "${ContactsContract.Contacts.DISPLAY_NAME} LIKE ?",
+                arrayOf("$prefix2%"),
+                "${ContactsContract.Contacts.DISPLAY_NAME} ASC",
+            )?.use { cursor ->
+                val idIdx   = cursor.getColumnIndex(ContactsContract.Contacts._ID)
+                val nameIdx = cursor.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
+                var scanned = 0
+                while (cursor.moveToNext() && scanned < 50 && fuzzyPairs.size < MAX_RESULTS) {
+                    scanned++
+                    val id = cursor.getLong(idIdx)
+                    if (id in existingIds) continue
+                    val dn = (cursor.getString(nameIdx) ?: continue).trim()
+                    // Only the reverse-prefix arm: query starts with display name.
+                    if (dn.length >= FUZZY_MIN_LEN &&
+                        query.startsWith(dn, ignoreCase = true) &&
+                        !dn.equals(query, ignoreCase = true)
+                    ) {
+                        fuzzyPairs.add(id to dn)
+                        existingIds.add(id)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Supplemental scan — any failure is safe to ignore.
         }
     }
 
@@ -275,4 +347,8 @@ object ContactResolver {
         // Any word in the display name starts with query: "Ma" → "Maria Santos"
         return displayName.split(Regex("\\s+")).any { it.startsWith(query, ignoreCase = true) }
     }
+
+    // Exposed for testing (it's pure logic, no Android deps).
+    internal fun isFuzzyMatchPublic(displayName: String, query: String): Boolean =
+        isFuzzyMatch(displayName, query)
 }
