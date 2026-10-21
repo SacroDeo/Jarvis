@@ -81,7 +81,7 @@ object ContactResolver {
      * Returns an empty list on no match, missing permission, or any provider error.
      */
     fun findContacts(context: Context, query: String): List<ContactCandidate> {
-        val q = normalizeContactQuery(query)
+        val q = query.trim()
         if (q.isEmpty()) return emptyList()
 
         val nameMatches = mutableListOf<ContactCandidate>()
@@ -207,7 +207,7 @@ object ContactResolver {
      * Returns [LookupResult.NotFound] on empty query, missing permission, or provider error.
      */
     fun lookup(context: Context, query: String): LookupResult {
-        val q = normalizeContactQuery(query)
+        val q = query.trim()
         if (q.isEmpty()) return LookupResult.NotFound
 
         // (contactId, trimmedDisplayName)
@@ -235,10 +235,7 @@ object ContactResolver {
                 while (cursor.moveToNext() && scanned < MAX_SCANNED_ROWS) {
                     scanned++
                     val id = cursor.getLong(idIdx)
-                    // Normalize stored name the same way we normalized the query so that
-                    // "Vijay  Kumar" (double-space from messaging imports) == "Vijay Kumar".
-                    val dn = normalizeContactQuery(cursor.getString(nameIdx) ?: continue)
-                    if (dn.isEmpty()) continue
+                    val dn = (cursor.getString(nameIdx) ?: continue).trim()
                     when {
                         dn.equals(q, ignoreCase = true) ->
                             exactPairs.add(id to dn)
@@ -354,25 +351,4 @@ object ContactResolver {
     // Exposed for testing (it's pure logic, no Android deps).
     internal fun isFuzzyMatchPublic(displayName: String, query: String): Boolean =
         isFuzzyMatch(displayName, query)
-
-    /**
-     * Normalize a contact name or lookup query before comparison.
-     *
-     * - Strips leading/trailing whitespace.
-     * - Collapses internal runs of whitespace to a single space.
-     * - Removes ASCII control characters and zero-width Unicode spaces that may
-     *   be silently inserted by messaging-app contact imports.
-     *
-     * Exact-match lookup uses this on both sides, so "Vijay  Kumar" (double-space)
-     * and "Vijay Kumar" (single-space) compare equal.
-     */
-    fun normalizeContactQuery(raw: String): String {
-        return raw
-            .trim()
-            // Strip zero-width and other invisible Unicode space-like characters
-            .replace(Regex("[\\u200B\\u200C\\u200D\\uFEFF\\u00AD]"), "")
-            // Collapse internal whitespace runs
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
 }

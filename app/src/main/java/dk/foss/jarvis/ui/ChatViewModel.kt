@@ -172,12 +172,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             toolExecutedThisTurn = true
                             val context = getApplication<Application>()
                             val result = AlarmTool.set(context, outcome.hour, outcome.minute, outcome.label)
-                            val resultMsg = if (result is AlarmTool.Result.Success)
-                                "Tool set_alarm: ${result.description}"
-                            else if (result is AlarmTool.Result.InvalidTime)
-                                "Tool set_alarm failed: invalid time ${outcome.hour}:${"%02d".format(outcome.minute)}"
-                            else
-                                "Tool set_alarm failed: ${(result as AlarmTool.Result.Failure).reason}"
+                            val resultMsg = when (result) {
+                                is AlarmTool.Result.Success     -> "Tool set_alarm: ${result.description}"
+                                is AlarmTool.Result.InvalidTime -> "Tool set_alarm failed: invalid time ${outcome.hour}:${"%02d".format(outcome.minute)}"
+                                is AlarmTool.Result.Failure     -> "Tool set_alarm failed: ${result.reason}"
+                            }
                             turnToolResults.add(ChatMessage("system", resultMsg))
                             responseBuffer.clear()
                             requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
@@ -193,14 +192,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             toolExecutedThisTurn = true
                             val context = getApplication<Application>()
                             val result = AppLaunchTool.open(context, outcome.appName)
-                            val resultMsg = if (result is AppLaunchTool.Result.Success)
-                                "Tool open_app executed: opened ${result.appLabel}"
-                            else if (result is AppLaunchTool.Result.NotFound)
-                                "Tool open_app failed: no app found for \"${result.query}\""
-                            else if (result is AppLaunchTool.Result.MultipleMatches)
-                                "Tool open_app ambiguous: matches ${result.labels.take(3).joinToString(", ")}"
-                            else
-                                "Tool open_app failed: ${(result as AppLaunchTool.Result.Failure).reason}"
+                            val resultMsg = when (result) {
+                                is AppLaunchTool.Result.Success         -> "Tool open_app executed: opened ${result.appLabel}"
+                                is AppLaunchTool.Result.NotFound        -> "Tool open_app failed: no app found for \"${result.query}\""
+                                is AppLaunchTool.Result.MultipleMatches -> "Tool open_app ambiguous: matches ${result.labels.take(3).joinToString(", ")}"
+                                is AppLaunchTool.Result.Failure         -> "Tool open_app failed: ${result.reason}"
+                            }
                             turnToolResults.add(ChatMessage("system", resultMsg))
                             responseBuffer.clear()
                             requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
@@ -211,40 +208,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             val redirectReply = "To place a call, please switch to voice mode by tapping the microphone."
                             repo.replaceMessage(assistantIndex, redirectReply)
                             finishStream()
-                        }
-
-                        is ToolRegistry.Outcome.DismissAlarmCall -> {
-                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
-                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
-                                finishStream(); return@onMain
-                            }
-                            orchestrationStep++; toolExecutedThisTurn = true
-                            val context = getApplication<Application>()
-                            val res = AlarmTool.dismissRinging(context, outcome.label.ifBlank { null })
-                            val msg = if (res is AlarmTool.DismissResult.Opened)
-                                "Tool dismiss_alarm: ${res.note}"
-                            else
-                                "Tool dismiss_alarm failed: ${(res as AlarmTool.DismissResult.Failure).reason}"
-                            turnToolResults.add(ChatMessage("system", msg))
-                            responseBuffer.clear()
-                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
-                        }
-
-                        is ToolRegistry.Outcome.ShowAlarmsCall -> {
-                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
-                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
-                                finishStream(); return@onMain
-                            }
-                            orchestrationStep++; toolExecutedThisTurn = true
-                            val context = getApplication<Application>()
-                            val opened = AlarmTool.showAlarms(context)
-                            val msg = if (opened)
-                                "Tool show_alarms: Clock app opened. User must delete alarm manually."
-                            else
-                                "Tool show_alarms failed: no Clock app found."
-                            turnToolResults.add(ChatMessage("system", msg))
-                            responseBuffer.clear()
-                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
                         }
 
                         is ToolRegistry.Outcome.Invalid -> {

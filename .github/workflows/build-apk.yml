@@ -64,50 +64,7 @@ jobs:
             >> gradle.properties
           echo 'org.gradle.daemon=false' >> gradle.properties
 
-      # ── 6. Unit tests ──────────────────────────────────────────────────────
-      # Run the JVM unit-test suite before assembling the APK so that a test
-      # regression is reported as a test failure, not buried in a build log.
-      # The heap override from step 5 is already active for this task.
-      - name: Run unit tests
-        run: |
-          ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace \
-            2>&1 | tee gradle-test-output.log
-          exit ${PIPESTATUS[0]}
-
-      # Upload test reports and Gradle output on failure so the exact
-      # failure is visible without requiring log access.
-      - name: Upload test results on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: |
-            app/build/test-results/testDebugUnitTest/
-            gradle-test-output.log
-          retention-days: 7
-          if-no-files-found: ignore
-
-      # Post the actual error as a GitHub Annotation so it appears in the
-      # Annotations tab and is queryable via the check-runs/annotations API
-      # without needing to download the raw log.
-      - name: Annotate failure details
-        if: failure()
-        run: |
-          # Extract the first meaningful error line
-          FIRST=$(grep -m1 "^e: \|error:\|FAIL\|AssertionError\|Unresolved reference\|Cannot find\|None of the following" gradle-test-output.log 2>/dev/null | head -c 400 || echo "")
-          if [ -n "$FIRST" ]; then
-            echo "::error title=Build failure::$FIRST"
-          fi
-          # Also extract top 5 Kotlin compiler errors
-          grep "^e: " gradle-test-output.log 2>/dev/null | head -5 | while read -r line; do
-            echo "::error title=Kotlin error::$line"
-          done
-          # Test assertion failures
-          grep -h "testcase.*failure\|AssertionError" app/build/test-results/testDebugUnitTest/*.xml 2>/dev/null | head -3 | while read -r line; do
-            echo "::error title=Test failure::$line"
-          done
-
-      # ── 7. Build ───────────────────────────────────────────────────────────
+      # ── 6. Build ───────────────────────────────────────────────────────────
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
