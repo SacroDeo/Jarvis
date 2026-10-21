@@ -300,6 +300,19 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startListening(fromWake: Boolean = false) {
+        // After MAX_EMPTY_WAKE consecutive wake-triggered turns with no speech, ignore
+        // further wake fires so the 20-second silence-exit countdown can run to completion.
+        //
+        // This is a deferred gate, not a permanent one:
+        //  • A mic tap (fromWake=false) always proceeds — no interruption to user-initiated turns.
+        //  • Real speech resets emptyWakeTurns in think() and startLocalCallFlow(), immediately
+        //    restoring full wake responsiveness for the rest of the session.
+        //  • stopAll() and resetView() also reset the counter, so the guard cannot
+        //    carry over to the next time the conversation screen opens.
+        //  • The wake engine itself continues running; only the ViewModel's response
+        //    to wake-triggered startListening() calls is gated.
+        if (fromWake && shouldDeferWakeTrigger(emptyWakeTurns)) return
+
         // A conversation auto-continues: after Jarvis speaks it listens again.
         continuous = true
         retriedThisTurn = false
@@ -1541,13 +1554,13 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
      * detect the next "Jarvis" without requiring a tap.
      *
      * The delay prevents TTS tail-echo from self-triggering and the WakeWordService
-     * REFRACTORY_MS (2500 ms) provides the hard gate against back-to-back fires —
-     * so no loop-breaker gate is needed here.
+     * REFRACTORY_MS (2500 ms) provides the hard gate against back-to-back fires.
      *
-     * Note: emptyWakeTurns is still counted for diagnostic purposes but no longer
-     * gates re-arming. The previous gate (MAX_EMPTY_WAKE) permanently suppressed
-     * the wake engine after 2 consecutive no-speech wake turns, which is the
-     * root cause of the "must press mic button" regression.
+     * [emptyWakeTurns] is incremented here for every wake-triggered turn that
+     * produced no speech.  Once it reaches [MAX_EMPTY_WAKE], [startListening]
+     * ignores further wake-triggered calls so the [silenceExit] timer can run
+     * to completion.  The wake engine itself stays running throughout; the counter
+     * resets on real speech, a mic tap, screen dismissal, or a new screen open.
      */
     private fun goIdle() {
         // Stop any recognition still in flight before re-arming the wake word.
@@ -1653,6 +1666,32 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         const val IDLE_FLUSH_MS = 350L
         const val STALL_MS = 800L
         const val WAKE_REARM_DELAY_MS = 1200L
+
+        /**
+         * Maximum consecutive wake-triggered turns that produced no speech before
+         * [startListening] ignores further wake-triggered calls.
+         *
+         * After this many empty turns the 20-second [silenceExit] timer is allowed
+         * to run to completion, automatically dismissing the screen.  The gate is
+         * in [startListening], not [goIdle], so the wake engine itself continues
+         * running — only the ViewModel's *response* to a wake fire is deferred.
+         *
+         * This value matches the documented original MAX_EMPTY_WAKE = 2.
+         * Recovery path: any real speech or mic tap resets [emptyWakeTurns] to 0
+         * immediately.  [stopAll] and [resetView] also reset it on screen close/open.
+         */
+        const val MAX_EMPTY_WAKE = 2
+
+        /**
+         * Pure gate predicate: true when a wake-triggered [startListening] call should
+         * be deferred so the silence-exit timer can complete.
+         *
+         * Exposed as `internal` so unit tests can verify the boundary condition
+         * (i.e. that turns 0..MAX_EMPTY_WAKE-1 are allowed through and turns
+         * >= MAX_EMPTY_WAKE are deferred) without needing an Android runtime.
+         */
+        internal fun shouldDeferWakeTrigger(emptyWakeTurns: Int): Boolean =
+            emptyWakeTurns >= MAX_EMPTY_WAKE
 
         /**
          * Maximum number of model↔tool iterations per user turn.
