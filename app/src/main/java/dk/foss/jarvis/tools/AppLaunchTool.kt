@@ -127,6 +127,7 @@ object AppLaunchTool {
      * Android [PackageManager].
      */
     internal fun scoreMatch(queryLower: String, labelLower: String): Int? = when {
+        queryLower.isEmpty() -> null
         labelLower == queryLower -> 0
         labelLower.startsWith(queryLower) -> 1
         queryLower.length >= FUZZY_MIN &&
