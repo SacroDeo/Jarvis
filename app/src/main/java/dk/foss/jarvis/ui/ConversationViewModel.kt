@@ -1662,7 +1662,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
     }
 
-    private companion object {
+    companion object {
         const val IDLE_FLUSH_MS = 350L
         const val STALL_MS = 800L
         const val WAKE_REARM_DELAY_MS = 1200L

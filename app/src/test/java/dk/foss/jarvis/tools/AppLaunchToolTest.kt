@@ -118,7 +118,7 @@ class AppLaunchToolScoreMatchTest {
         assertNull(score("weather", "google maps"))
     }
 
-    @Test fun `empty query returns null (score 0 fails: empty != non-empty)`() {
+    @Test fun `empty query returns null (score 0 fails, empty != non-empty)`() {
         // labelLower == queryLower only if label is also empty; otherwise no match.
         assertNull(score("", "chrome"))
     }
