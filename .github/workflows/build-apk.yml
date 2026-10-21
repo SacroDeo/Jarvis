@@ -64,11 +64,33 @@ jobs:
             >> gradle.properties
           echo 'org.gradle.daemon=false' >> gradle.properties
 
-      # ── 6. Build ───────────────────────────────────────────────────────────
+      # ── 6. Unit tests ──────────────────────────────────────────────────────
+      # Run the full JVM unit-test suite before building the APK so a test
+      # failure blocks the build immediately.  --continue lets all test classes
+      # run even after the first failure so the uploaded report covers every
+      # broken test, not just the first one.
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --continue
+
+      # ── 7. Upload test results ─────────────────────────────────────────────
+      # Upload HTML + XML reports regardless of test outcome (if: always()) so
+      # failures are diagnosable without re-running the workflow.
+      # if-no-files-found: warn so a compile failure is not masked by a second
+      # artifact-upload error on top of it.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── 8. Build ───────────────────────────────────────────────────────────
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      # ── 7. Artifact ────────────────────────────────────────────────────────
+      # ── 9. Artifact ────────────────────────────────────────────────────────
       # The APK is uploaded as a GitHub Actions artifact and can be downloaded
       # from the workflow run page.  It is retained for 30 days.
       - name: Upload debug APK
