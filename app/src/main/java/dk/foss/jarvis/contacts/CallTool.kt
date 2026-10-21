@@ -204,7 +204,10 @@ object ToolRegistry {
             val minute = envelope.alarm_minute
             val label  = envelope.alarm_label.trim()
             if (hour !in 0..23 || minute !in 0..59) return Outcome.Invalid
-            if (label.isEmpty() || label.length > MAX_LABEL_LEN) return Outcome.Invalid
+            // Empty label is allowed: AlarmTool.set() substitutes "Alarm" for blank labels,
+            // so the parser does not need to reject it. Only genuinely over-length labels
+            // are rejected to prevent a runaway string from reaching the intent extra.
+            if (label.length > MAX_LABEL_LEN) return Outcome.Invalid
             if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
             return Outcome.SetAlarmCall(hour = hour, minute = minute, label = label, ack = reply)
         }

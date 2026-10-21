@@ -86,12 +86,23 @@ object AppLaunchTool {
 
     private fun queryLaunchableApps(pm: PackageManager): List<ResolveInfo> {
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        return pm.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        // Use flags=0 (no additional filters) so that all apps advertising
+        // ACTION_MAIN + CATEGORY_LAUNCHER are returned.
+        //
+        // MATCH_DEFAULT_ONLY was the previous flag; it implicitly adds a
+        // CATEGORY_DEFAULT requirement which most launcher activities do not
+        // declare.  On stock Android the extra category is tolerated, but on
+        // some OEM variants (e.g. Realme ColorOS) it causes the query to return
+        // an empty list, making every app appear "not found".
+        return pm.queryIntentActivities(intent, 0)
     }
 
     /**
      * Assign a priority score to each app whose label matches [queryLower].
      * Lower score = better match.  Apps with no match are excluded.
+     *
+     * The scoring logic is extracted into [scoreMatch] so it can be verified
+     * by unit tests without an Android runtime.
      */
     private fun rank(
         queryLower: String,
@@ -100,15 +111,27 @@ object AppLaunchTool {
     ): List<Pair<ResolveInfo, Int>> {
         return apps.mapNotNull { ri ->
             val labelLower = ri.loadLabel(pm).toString().lowercase()
-            val score = when {
-                labelLower == queryLower -> 0
-                labelLower.startsWith(queryLower) -> 1
-                queryLower.length >= FUZZY_MIN &&
-                    labelLower.split(Regex("\\s+")).any { it.startsWith(queryLower) } -> 2
-                queryLower.length >= FUZZY_MIN && labelLower.contains(queryLower) -> 3
-                else -> return@mapNotNull null
-            }
+            val score = scoreMatch(queryLower, labelLower) ?: return@mapNotNull null
             Pair(ri, score)
         }.sortedBy { it.second }
+    }
+
+    /**
+     * Return the match priority for [queryLower] against [labelLower]
+     * (both already lowercased by the caller).
+     *
+     * 0 = exact  |  1 = label-starts-with  |  2 = word-starts-with  |  3 = contains
+     * null = no match
+     *
+     * Exposed as `internal` so unit tests can exercise matching without an
+     * Android [PackageManager].
+     */
+    internal fun scoreMatch(queryLower: String, labelLower: String): Int? = when {
+        labelLower == queryLower -> 0
+        labelLower.startsWith(queryLower) -> 1
+        queryLower.length >= FUZZY_MIN &&
+            labelLower.split(Regex("\\s+")).any { it.startsWith(queryLower) } -> 2
+        queryLower.length >= FUZZY_MIN && labelLower.contains(queryLower) -> 3
+        else -> null
     }
 }

@@ -44,10 +44,15 @@ class SettingsStore(private val context: Context) {
         val ELEVEN_KEY = stringPreferencesKey("eleven_key")
         val ELEVEN_VOICE = stringPreferencesKey("eleven_voice")
         val WAKE_ENABLED = booleanPreferencesKey("wake_enabled")
+        // Legacy key: written by automatic "best male English" selection in
+        // older builds; a value here cannot be told apart from a deliberate user
+        // choice made in those versions.  Cleaned up by migrateLegacyTtsVoice()
+        // whenever the user saves settings; also removed by updateTtsVoice().
+        // Now also used as a read-fallback so users who had a voice selected in
+        // an older build do not lose it on first launch after updating.
         val TTS_VOICE_ID = stringPreferencesKey("tts_voice_id")
-        // Legacy key: it was also written by an automatic "best male English" pick, so a
-        // value there cannot be told apart from a deliberate user choice.  Only ever
-        // removed now (see migrateLegacyTtsVoice), never read.
+        // Current key: written only by an explicit user selection in the JARVIS
+        // voice picker (updateTtsVoice).  Takes precedence over TTS_VOICE_ID.
         val TTS_VOICE_USER = stringPreferencesKey("tts_voice_user")
         val SPEAKER_VERIFICATION_ENABLED = booleanPreferencesKey("speaker_verification_enabled")
     }
@@ -61,7 +66,7 @@ class SettingsStore(private val context: Context) {
             elevenVoiceId = (p[Keys.ELEVEN_VOICE] ?: "")
                 .ifEmpty { BuildConfig.DEFAULT_ELEVEN_VOICE.ifEmpty { DEFAULT_ELEVEN_VOICE } },
             wakeEnabled = p[Keys.WAKE_ENABLED] ?: false,
-            ttsVoiceUserId = p[Keys.TTS_VOICE_USER],
+            ttsVoiceUserId = p[Keys.TTS_VOICE_USER] ?: p[Keys.TTS_VOICE_ID],
             speakerVerificationEnabled = p[Keys.SPEAKER_VERIFICATION_ENABLED] ?: false,
         )
     }

@@ -603,9 +603,25 @@ class MultiToolSchemaTest {
         assertTrue(out is ToolRegistry.Outcome.Invalid)
     }
 
-    @Test fun `set_alarm with empty label is Invalid`() {
+    // Fix 1 regression: empty alarm_label must no longer be rejected.
+    // AlarmTool.set() substitutes "Alarm" for any blank label (AlarmTool.kt:47),
+    // so the parser does not need to pre-validate this field for emptiness.
+    @Test fun `set_alarm with empty label now produces SetAlarmCall (not Invalid)`() {
         val out = parse(envelope(tool = "set_alarm", alarmHour = 7, alarmMinute = 0, alarmLabel = ""))
-        assertTrue(out is ToolRegistry.Outcome.Invalid)
+        assertTrue(
+            "Empty alarm_label must reach AlarmTool; AlarmTool substitutes 'Alarm' for blank labels",
+            out is ToolRegistry.Outcome.SetAlarmCall,
+        )
+        assertEquals("", (out as ToolRegistry.Outcome.SetAlarmCall).label)
+    }
+
+    @Test fun `set_alarm with empty label and allowTool=false still downgrades to Reply`() {
+        val out = parse(
+            envelope(reply = "Setting alarm", tool = "set_alarm", alarmHour = 7, alarmMinute = 0, alarmLabel = ""),
+            allowTool = false,
+        )
+        assertTrue(out is ToolRegistry.Outcome.Reply)
+        assertEquals("Setting alarm", (out as ToolRegistry.Outcome.Reply).text)
     }
 
     @Test fun `set_alarm with allowTool=false downgrades to Reply`() {
@@ -839,9 +855,15 @@ class AlarmToolHonestyTest {
         assertTrue(ToolRegistry.parse(json, true) is ToolRegistry.Outcome.Invalid)
     }
 
-    @Test fun `set_alarm with empty label is rejected in parse`() {
+    @Test fun `set_alarm with empty label is no longer rejected in parse (Fix 1)`() {
+        // Before Fix 1, an empty alarm_label caused Outcome.Invalid — but AlarmTool
+        // already substitutes "Alarm" for blank, so the parser rejection was redundant.
         val json = """{"reply":"ok","tool":"set_alarm","contact_name":"","alarm_hour":7,"alarm_minute":0,"alarm_label":"","app_name":""}"""
-        assertTrue(ToolRegistry.parse(json, true) is ToolRegistry.Outcome.Invalid)
+        val outcome = ToolRegistry.parse(json, true)
+        assertTrue(
+            "empty label must reach AlarmTool after Fix 1 — AlarmTool substitutes 'Alarm'",
+            outcome is ToolRegistry.Outcome.SetAlarmCall,
+        )
     }
 
     @Test fun `set_alarm missing time produces clarification reply`() {
@@ -890,10 +912,14 @@ class OrchestrationLoopTest {
         assertEquals("Calling Maa", (outcome as ToolRegistry.Outcome.Reply).text)
     }
 
-    @Test fun `Invalid outcome when all tool fields are empty and tool is set_alarm`() {
-        // label is empty — must reject
+    @Test fun `set_alarm with empty label reaches SetAlarmCall after Fix 1`() {
+        // label="" is schema-valid; AlarmTool.set() substitutes "Alarm" for blank.
+        // After Fix 1 this must NOT be Invalid.
         val json = makeEnvelope(tool = "set_alarm", alarmLabel = "")
-        assertTrue(ToolRegistry.parse(json, true) is ToolRegistry.Outcome.Invalid)
+        assertTrue(
+            "empty label must no longer be Invalid (Fix 1)",
+            ToolRegistry.parse(json, true) is ToolRegistry.Outcome.SetAlarmCall,
+        )
     }
 
     @Test fun `normal question produces Reply without tool`() {
