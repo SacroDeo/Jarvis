@@ -5,6 +5,8 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.Looper
 import java.io.ByteArrayOutputStream
@@ -34,8 +36,10 @@ class AudioCapture(private val context: Context) {
         active = true
         val gen = ++generation
         thread = Thread {
-            var record: AudioRecord? = null
-            try {
+        var record: AudioRecord? = null
+        var aec: AcousticEchoCanceler? = null
+        var ns: NoiseSuppressor? = null
+        try {
                 val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
                 val bufSize = maxOf(minBuf, SAMPLE_RATE) // ~1s internal headroom
                 record = AudioRecord(
@@ -55,6 +59,21 @@ class AudioCapture(private val context: Context) {
                 val preRoll = ArrayDeque<ByteArray>()
                 var preRollMs = 0
                 record.startRecording()
+
+                // Attach acoustic echo cancellation and noise suppression where
+                // available.  These reduce microphone pick-up of TTS output from the
+                // phone speaker, improving recognition accuracy after Jarvis speaks.
+                // Both effects are guarded: an unsupported device skips them silently.
+                if (AcousticEchoCanceler.isAvailable()) {
+                    aec = runCatching {
+                        AcousticEchoCanceler.create(record.audioSessionId)?.also { it.enabled = true }
+                    }.getOrNull()
+                }
+                if (NoiseSuppressor.isAvailable()) {
+                    ns = runCatching {
+                        NoiseSuppressor.create(record.audioSessionId)?.also { it.enabled = true }
+                    }.getOrNull()
+                }
 
                 var speechStarted = false
                 var speechFrames = 0
@@ -128,6 +147,9 @@ class AudioCapture(private val context: Context) {
             } catch (e: Exception) {
                 if (gen == generation) post { onError(e.message ?: "Recording failed") }
             } finally {
+                // Release effects before the AudioRecord so the audio session is still valid.
+                runCatching { aec?.release() }
+                runCatching { ns?.release() }
                 // Only clear the shared flag if we're still the current generation,
                 // so a stale thread can't disarm a newer capture.
                 if (gen == generation) active = false
