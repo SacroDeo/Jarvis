@@ -22,6 +22,7 @@ import dk.foss.jarvis.data.SettingsStore
 import dk.foss.jarvis.tools.AlarmTool
 import dk.foss.jarvis.tools.AppLaunchTool
 import dk.foss.jarvis.voice.AndroidTts
+import dk.foss.jarvis.voice.AudioFocusHold
 import dk.foss.jarvis.voice.ContactAwarePrivacyFilter
 import dk.foss.jarvis.voice.ElevenLabsTts
 import dk.foss.jarvis.voice.PrivacyFilter
@@ -91,6 +92,13 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private val main = Handler(Looper.getMainLooper())
     private var recognizer: VoiceRecognizer? = null
     private var speakerVerifier: SpeakerVerifier? = null
+    /**
+     * Audio focus held for the duration of a voice conversation so music players
+     * and other audio apps pause during recognition and TTS.  Acquired on the
+     * first [startListening] call; released in [stopAll] and [onCleared].
+     * Never released in [goIdle] or between turns — the conversation is still active.
+     */
+    private val audioFocus = AudioFocusHold(app)
     /**
      * Privacy filter for this conversation session.
      * [ContactAwarePrivacyFilter] loads contact display names lazily after
@@ -324,7 +332,11 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         armListeningWatchdog()
         // Free the mic from the always-on wake listener so STT can record, and cancel
         // any pending re-arm so the wake engine doesn't grab the mic mid-capture.
+        // Acquire audio focus first so music players pause before the mic opens and
+        // before TTS starts.  Idempotent: re-entrant on subsequent turns within the
+        // same conversation is a safe no-op.
         main.removeCallbacks(rearmWake)
+        audioFocus.take()
         WakeWordService.pauseListening()
         viewModelScope.launch {
             ensureReady()
@@ -1641,6 +1653,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         // Save the conversation (covers turns that ended in an error/cancel, not just
         // successful replies) before handing the mic back to the wake listener.
         repo.persistAsync()
+        // Conversation is fully over: release audio focus so music and other audio
+        // apps resume.  Must happen before resumeListening() so no brief window
+        // exists where neither JARVIS nor the wake engine holds the mic.
+        audioFocus.release()
         WakeWordService.resumeListening()
     }
 
@@ -1658,6 +1674,7 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         tts?.shutdown()
         androidFallback?.shutdown()
         repo.persistAsync()
+        audioFocus.release()
         WakeWordService.resumeListening()
         super.onCleared()
     }
