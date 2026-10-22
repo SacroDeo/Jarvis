@@ -179,7 +179,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             turnToolResults.add(ChatMessage("system", resultMsg))
                             responseBuffer.clear()
-                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = true)
                         }
 
                         is ToolRegistry.Outcome.OpenAppCall -> {
@@ -200,7 +200,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             turnToolResults.add(ChatMessage("system", resultMsg))
                             responseBuffer.clear()
-                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = false)
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = true)
                         }
 
                         is ToolRegistry.Outcome.ToolCall -> {

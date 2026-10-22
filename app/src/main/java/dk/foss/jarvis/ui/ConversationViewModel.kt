@@ -1061,12 +1061,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Send a follow-up model request after a non-call tool has executed.
      *
-     * The request includes the full turn history plus the tool-result messages
-     * accumulated in [turnToolResults].  [allowTool] is `false` so the model
-     * cannot request another tool in this iteration, preventing unbounded loops.
-     *
-     * [orchestrationStep] is incremented here; if the limit is reached the
-     * model is not called again and Jarvis speaks a safe fallback.
+     * [allowTool] is now `true` so the model can request a second tool in the
+     * same user turn (multi-step requests such as "Open YouTube and set an alarm
+     * for 7:30").  The [orchestrationStep] counter bounds the loop at
+     * [MAX_ORCHESTRATION_STEPS] total tool executions to prevent runaway spend.
      */
     private fun continueWithToolResult(myTurn: Int) {
         if (turn != myTurn) return
@@ -1106,8 +1104,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             repo.sessionId,
             object : WorkerClient.StreamCallbacks {
                 override fun onDelta(textDelta: String) = onMain {
-                    // allowTool=false: even if the model tries a tool it becomes a Reply.
-                    if (turn == myStepTurn) handleStructuredContent(textDelta, myStepTurn, allowTool = false)
+                    // allowTool=true: the model may request another tool to chain
+                    // actions in a single user turn.  The orchestrationStep counter
+                    // above bounds how many tool iterations can occur total.
+                    if (turn == myStepTurn) handleStructuredContent(textDelta, myStepTurn, allowTool = true)
                 }
                 override fun onSessionId(id: String) { repo.setSessionId(id) }
                 override fun onComplete() = onMain {
@@ -1116,6 +1116,16 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                         main.removeCallbacks(stallIndicator)
                         working.value = false
                         stalled.value = false
+                        return@onMain
+                    }
+                    // Another tool may have executed in onDelta — recurse if so.
+                    val pendingResult = pendingToolResultForModel
+                    if (pendingResult != null) {
+                        pendingToolResultForModel = null
+                        main.removeCallbacks(stallIndicator)
+                        working.value = false
+                        stalled.value = false
+                        continueWithToolResult(myStepTurn)
                         return@onMain
                     }
                     completeStructuredTurn()
