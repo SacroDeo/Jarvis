@@ -421,6 +421,17 @@ class ContactResolverFuzzyMatchTest {
         assertFalse(fuzzy("John Smith", "Maa"))
     }
 
+    @Test fun `partial first name matches full name (real-world single-fuzzy-match scenario)`() {
+        // User says "Priya" but contact is "Priya Singh".
+        // isFuzzyMatch returns true → FuzzyMatches with one result → should now auto-dial.
+        assertTrue(fuzzy("Priya Singh", "Priya"))
+    }
+
+    @Test fun `partial surname matches full name via word prefix`() {
+        // User says "Singh" → "Priya Singh" via word-start check.
+        assertTrue(fuzzy("Priya Singh", "Singh"))
+    }
+
     @Test fun `exact match is NOT fuzzy (handled upstream as exact)`() {
         // isFuzzyMatch would still return true for "Maa"/"Maa" via startsWith.
         // The caller (lookup) checks exact first, so this is informational only.

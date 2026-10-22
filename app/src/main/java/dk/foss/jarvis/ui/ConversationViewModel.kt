@@ -1219,10 +1219,39 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                     speakAndListenForStage(prompt)
                 }
                 is LookupResult.FuzzyMatches -> {
-                    callStage = CallStage.ClarifyContacts(contactName, result.contacts)
-                    val prompt = CallFlowPolicy.fuzzyMatchPrompt(result.contacts.map { it.displayName })
-                    reply.value = prompt
-                    speakAndListenForStage(prompt)
+                    if (result.contacts.size == 1) {
+                        // Single fuzzy match — no ambiguity, proceed exactly like ExactUnique.
+                        // Asking the user to "pick from a list of one" is unnecessary friction;
+                        // if the match is wrong they can cancel via the dial screen.
+                        val contact = result.contacts[0]
+                        when {
+                            contact.numbers.isEmpty() -> {
+                                cancelCallFlow()
+                                enqueueSpeech("I found ${contact.displayName}, but they have no phone number saved.")
+                                streamDone = true
+                                pump()
+                            }
+                            contact.numbers.size == 1 -> {
+                                cancelCallFlow()
+                                dial(contact, contact.numbers[0])
+                            }
+                            else -> {
+                                callStage = CallStage.ClarifyNumbers(contact)
+                                val prompt = CallFlowPolicy.clarifyNumbersPrompt(
+                                    contact.displayName,
+                                    contact.numbers.map { it.label },
+                                )
+                                reply.value = prompt
+                                speakAndListenForStage(prompt)
+                            }
+                        }
+                    } else {
+                        // Multiple fuzzy candidates — let the user choose.
+                        callStage = CallStage.ClarifyContacts(contactName, result.contacts)
+                        val prompt = CallFlowPolicy.fuzzyMatchPrompt(result.contacts.map { it.displayName })
+                        reply.value = prompt
+                        speakAndListenForStage(prompt)
+                    }
                 }
                 is LookupResult.NotFound -> {
                     roundTripReask("No contact named \"$contactName\" was found. Ask the user for a more specific name.")
