@@ -132,6 +132,13 @@ object ToolRegistry {
           list. Strip all context words: "from work", "my friend", "the doctor", etc.
           Examples: "call Rahul from work" → contact_name "Rahul";
                     "phone my friend Priya" → contact_name "Priya".
+        - Context and follow-ups: if the user says "call him" or "call her" after a previous
+          mention, use the name from the conversation history as contact_name.
+        - Multi-step requests: you may be called multiple times in a single turn. Each call
+          handles ONE action. After you select a tool and the device executes it, you will
+          receive the result and can choose the next action. Use this to handle requests like
+          "Open YouTube and set an alarm for 7 AM" — first call: open YouTube, second call:
+          set alarm. Only use tool "none" when all actions in the request are complete.
         - Keep every reply short and natural — it will be spoken aloud.
         - If a request is ambiguous, ask for clarification in reply.
         - For set_alarm and open_app: the system tells you whether the Android intent was

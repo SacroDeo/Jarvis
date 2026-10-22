@@ -20,6 +20,7 @@ import dk.foss.jarvis.data.ConversationRepository
 import dk.foss.jarvis.data.JarvisSettings
 import dk.foss.jarvis.data.SettingsStore
 import dk.foss.jarvis.tools.AlarmTool
+import dk.foss.jarvis.tools.AppIntentDetector
 import dk.foss.jarvis.tools.AppLaunchTool
 import dk.foss.jarvis.voice.AndroidTts
 import dk.foss.jarvis.voice.AudioFocusHold
@@ -636,17 +637,21 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 think(text)
             }
             is CallStage.None -> {
-                // ── Local fast path ────────────────────────────────────────────
-                // Detect "call/phone/dial <name>" without an AI roundtrip.
-                // This is the primary fix: the AI previously returned tool:"none" with
-                // a clarifying question instead of tool:"call_contact", causing a
-                // spoken confirmation step the user had to answer verbally.
+                // ── Local fast path 1: call commands ──────────────────────────
                 val callTarget = CallIntentDetector.extractCallTarget(text)
                 if (callTarget != null) {
                     startLocalCallFlow(callTarget, text)
-                } else {
-                    think(text)
+                    return
                 }
+                // ── Local fast path 2: app-open commands ──────────────────────
+                // "open YouTube", "launch Chrome", etc. — resolved without an AI
+                // roundtrip so the app appears faster and token cost is avoided.
+                val appTarget = AppIntentDetector.extractAppName(text)
+                if (appTarget != null) {
+                    startLocalAppFlow(appTarget, text)
+                    return
+                }
+                think(text)
             }
         }
     }
@@ -683,6 +688,58 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         repo.addMessage("user", sanitizedText)
 
         executeCallTool(contactName, myTurn)
+    }
+
+    /**
+     * Local fast path for app-opening commands ("open YouTube", "launch Chrome", …).
+     *
+     * Mirrors [startLocalCallFlow] for phone calls: resolves the app immediately on
+     * the device without an AI roundtrip.  On success, speaks a brief confirmation and
+     * stays in the same conversation.  On failure (app not found or cannot launch),
+     * falls back to [think] so the AI can handle the request or ask for clarification.
+     */
+    private fun startLocalAppFlow(appName: String, rawText: String) {
+        val myTurn = turn
+        emptyWakeTurns = 0
+        cancelCallFlow()
+        cancelListeningWatchdog()
+        hint.value = null
+        state.value = ConvState.Thinking
+        working.value = true
+        main.postDelayed(stallIndicator, STALL_MS)
+
+        val filterResult = privacyFilter.filter(rawText)
+        val sanitizedText = filterResult.sanitizedText
+        repo.addMessage("user", sanitizedText)
+
+        val context = getApplication<Application>()
+        val result = AppLaunchTool.open(context, appName)
+
+        main.removeCallbacks(stallIndicator)
+        working.value = false
+        stalled.value = false
+
+        if (turn != myTurn) return
+
+        when (result) {
+            is AppLaunchTool.Result.Success -> {
+                // App launched — confirm briefly and continue the conversation.
+                val ack = "Opening ${result.appLabel}."
+                repo.addMessage("assistant", ack)
+                viewModelScope.launch { repo.persist() }
+                enqueueSpeech(ack)
+                streamDone = true
+                pump()
+            }
+            is AppLaunchTool.Result.MultipleMatches -> {
+                // Ambiguous name — ask the AI to clarify or try the first match.
+                think(rawText)
+            }
+            else -> {
+                // Not found or failure — let the AI handle it (may ask the user).
+                think(rawText)
+            }
+        }
     }
 
     /**
