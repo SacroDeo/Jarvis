@@ -128,6 +128,10 @@ object ToolRegistry {
         - For all other requests use tool "none" and reply conversationally.
         - Phone numbers and contact details never appear in your output — the device
           resolves them locally.
+        - contact_name must contain ONLY the person's name as they would appear in a contacts
+          list. Strip all context words: "from work", "my friend", "the doctor", etc.
+          Examples: "call Rahul from work" → contact_name "Rahul";
+                    "phone my friend Priya" → contact_name "Priya".
         - Keep every reply short and natural — it will be spoken aloud.
         - If a request is ambiguous, ask for clarification in reply.
         - For set_alarm and open_app: the system tells you whether the Android intent was

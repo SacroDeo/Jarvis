@@ -692,6 +692,13 @@ class MultiToolSchemaTest {
         assertTrue("system prompt must mention none",          prompt.contains("none"))
     }
 
+    @Test fun `MULTI_TOOL_SYSTEM_PROMPT instructs model to strip context words from contact name`() {
+        // Prevents the model returning "Rahul from work" instead of "Rahul".
+        val prompt = ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT
+        assertTrue("prompt must explain contact_name stripping",
+            prompt.contains("ONLY the person's name") || prompt.contains("Strip all context"))
+    }
+
     @Test fun `CALL_ENVELOPE_SCHEMA alias matches MULTI_TOOL_SCHEMA`() {
         // Backward-compat alias must point to the same object.
         assertTrue(ToolRegistry.CALL_ENVELOPE_SCHEMA === ToolRegistry.MULTI_TOOL_SCHEMA)
