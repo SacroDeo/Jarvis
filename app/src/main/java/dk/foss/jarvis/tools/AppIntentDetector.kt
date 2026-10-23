@@ -57,12 +57,18 @@ object AppIntentDetector {
         for (prefix in OPEN_PREFIXES) {
             if (!lower.startsWith(prefix) || lower.length <= prefix.length) continue
 
-            val candidate = text.trim()
+            var candidate = text.trim()
                 .substring(prefix.length)
                 .trimEnd('.', '!', '?', ',', ';', ':')
                 .trim()
 
             if (candidate.isBlank() || candidate.length < 2) continue
+
+            // Strip a leading article ("the Clock" → "Clock", "a Camera" → "Camera").
+            // This prevents passing "the clock" as the query to AppLaunchTool, where
+            // scoreMatch("the clock", "clock") would return null despite a clear intent.
+            val stripped = stripLeadingArticle(candidate)
+            if (stripped.isNotBlank() && stripped.length >= 2) candidate = stripped
 
             val words = candidate.lowercase().split(Regex("\\s+"))
 
@@ -78,5 +84,16 @@ object AppIntentDetector {
             return candidate
         }
         return null
+    }
+
+    /** Strip a leading "a ", "an ", or "the " (case-insensitive). */
+    private fun stripLeadingArticle(text: String): String {
+        val lower = text.lowercase()
+        for (article in listOf("the ", "an ", "a ")) {
+            if (lower.startsWith(article) && text.length > article.length) {
+                return text.substring(article.length).trim()
+            }
+        }
+        return text
     }
 }

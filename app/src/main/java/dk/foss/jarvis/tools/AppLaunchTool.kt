@@ -53,7 +53,17 @@ object AppLaunchTool {
         Log.d(TAG, "queryLaunchableApps found ${launchables.size} apps, " +
             "matching against query='${query.take(30)}'")
 
-        val ranked = rank(query.lowercase(), launchables, pm)
+        // Try exact query first, then the article-stripped version (handles "open the Clock"
+        // → strip "the " → "Clock"). Normalization never widens the match to unrelated apps.
+        val queryLower = query.lowercase()
+        val queryStripped = stripLeadingArticle(queryLower)
+
+        var ranked = rank(queryLower, launchables, pm)
+        if (ranked.isEmpty() && queryStripped != queryLower) {
+            Log.d(TAG, "No match for '$queryLower', retrying stripped '$queryStripped'")
+            ranked = rank(queryStripped, launchables, pm)
+        }
+
         if (ranked.isEmpty()) {
             Log.i(TAG, "No app matched query='${query.take(30)}' (total apps scanned: ${launchables.size})")
             return Result.NotFound(query)
@@ -100,7 +110,28 @@ object AppLaunchTool {
         // declare.  On stock Android the extra category is tolerated, but on
         // some OEM variants (e.g. Realme ColorOS) it causes the query to return
         // an empty list, making every app appear "not found".
+        //
+        // Deduplicate by package name: some packages register multiple launcher
+        // activities (e.g. a main activity + an alias).  Keeping only the first
+        // entry per package prevents false MultipleMatches for a single app.
         return pm.queryIntentActivities(intent, 0)
+            .distinctBy { it.activityInfo.packageName }
+    }
+
+    /**
+     * Strip a leading article ("a ", "an ", "the ") from a lowercase query so
+     * "the clock" resolves to "clock", "a camera" to "camera", etc.
+     * Returns the original string unchanged if no article is present.
+     *
+     * Exposed as `internal` for unit tests.
+     */
+    internal fun stripLeadingArticle(queryLower: String): String {
+        for (article in listOf("the ", "an ", "a ")) {
+            if (queryLower.startsWith(article) && queryLower.length > article.length) {
+                return queryLower.substring(article.length)
+            }
+        }
+        return queryLower
     }
 
     /**
@@ -126,8 +157,18 @@ object AppLaunchTool {
      * Return the match priority for [queryLower] against [labelLower]
      * (both already lowercased by the caller).
      *
-     * 0 = exact  |  1 = label-starts-with  |  2 = word-starts-with  |  3 = contains
+     * 0 = exact  |  1 = label-starts-with  |  2 = word-starts-with  |
+     * 3 = label-contains-query  |  4 = label-is-a-word-in-query
      * null = no match
+     *
+     * Score 4 ("label appears as a complete word in query") handles phrases like
+     * "Open Google Chrome" when the installed app is labeled "Chrome": the word
+     * "Chrome" appears verbatim in the query.  A substring check was rejected
+     * because it would falsely match "ok" (2-char label) against "book" or "hook".
+     * The whitespace-split word check avoids that: "book".split = ["book"]; "ok"
+     * is not in that list, so no match.
+     *
+     * The label must be at least FUZZY_MIN chars to avoid trivially short tokens.
      *
      * Exposed as `internal` so unit tests can exercise matching without an
      * Android [PackageManager].
@@ -139,6 +180,9 @@ object AppLaunchTool {
         queryLower.length >= FUZZY_MIN &&
             labelLower.split(Regex("\\s+")).any { it.startsWith(queryLower) } -> 2
         queryLower.length >= FUZZY_MIN && labelLower.contains(queryLower) -> 3
+        // "open Google Chrome" has "chrome" as a word → matches label "chrome"
+        labelLower.length >= FUZZY_MIN &&
+            queryLower.split(Regex("\\s+")).any { it == labelLower } -> 4
         else -> null
     }
 }

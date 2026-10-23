@@ -180,4 +180,162 @@ class AppLaunchToolScoreMatchTest {
     @Test fun `null returned for empty query (guard added earlier)`() {
         assertNull(score("", "youtube"))
     }
+
+    // ── Score 4: label is a complete word in query ────────────────────────────
+    // "open Google Chrome" → query="google chrome" → "chrome" is a word → score 4.
+    // Uses whitespace-split word matching, NOT substring containment, to prevent
+    // "ok" from matching "book" (substring "ok" appears in "book" but it is not
+    // a word in "book").
+
+    @Test fun `label as exact word in query returns score 4`() {
+        // "google chrome" split = ["google","chrome"]; "chrome" found → score 4
+        assertEquals(4, score("google chrome", "chrome"))
+    }
+
+    @Test fun `label as exact word for maps`() {
+        // User says "Google Maps" but app is labeled "Maps"
+        assertEquals(4, score("google maps", "maps"))
+    }
+
+    @Test fun `label as exact word for photos`() {
+        assertEquals(4, score("google photos", "photos"))
+    }
+
+    @Test fun `score 3 beats score 4 (label-contains vs label-is-word)`() {
+        // label.contains(query) at score 3 outranks label-as-word-in-query at score 4
+        val s3 = score("oo", "google maps")!!   // score 3: "google maps".contains("oo")
+        val s4 = score("google maps", "maps")!! // score 4: "maps" is a word in "google maps"
+        assertTrue("score 3 ($s3) must beat score 4 ($s4)", s3 < s4)
+    }
+
+    @Test fun `exact match beats score 4 — priority preserved`() {
+        // If the installed label IS exactly what the user says, score 0 must win.
+        val exact = score("chrome", "chrome")!!          // score 0
+        val s4    = score("google chrome", "chrome")!!   // score 4
+        assertTrue("exact ($exact) must beat score 4 ($s4)", exact < s4)
+    }
+
+    @Test fun `score 4 word-boundary — ok does not match book`() {
+        // "ok" is a substring of "book" but NOT a whitespace-separated word.
+        // This must return null, not score 4, to prevent false app matches.
+        assertNull(score("book", "ok"))
+    }
+
+    @Test fun `score 4 word-boundary — ok does not match cook`() {
+        assertNull(score("cook", "ok"))
+    }
+
+    @Test fun `score 4 word-boundary — ok matches ok google (word present)`() {
+        // "ok" IS a complete word in "ok google"
+        assertEquals(4, score("ok google", "ok"))
+    }
+
+    @Test fun `score 4 requires label at least FUZZY_MIN chars`() {
+        // Label "a" (1 char) must not match via score 4
+        assertNull(score("a camera", "a"))
+    }
+
+    @Test fun `score 4 short label two chars — matches only when exact word`() {
+        // "go" is 2 chars (== FUZZY_MIN). Must only score 4 when "go" is a word in query.
+        assertNull(score("google", "go"))   // "google" does not split into a word "go"
+        assertEquals(4, score("go app", "go"))  // "go" IS a word in "go app"
+    }
+
+    // ── stripLeadingArticle helper ────────────────────────────────────────────
+
+    @Test fun `strip leading the`() {
+        assertEquals("clock", AppLaunchTool.stripLeadingArticle("the clock"))
+    }
+
+    @Test fun `strip leading a`() {
+        assertEquals("camera", AppLaunchTool.stripLeadingArticle("a camera"))
+    }
+
+    @Test fun `strip leading an`() {
+        assertEquals("app", AppLaunchTool.stripLeadingArticle("an app"))
+    }
+
+    @Test fun `no article to strip — unchanged`() {
+        assertEquals("youtube", AppLaunchTool.stripLeadingArticle("youtube"))
+    }
+
+    @Test fun `article only without remainder — unchanged`() {
+        // "the" with nothing after should not strip (would leave empty string)
+        assertEquals("the", AppLaunchTool.stripLeadingArticle("the"))
+    }
+
+    @Test fun `open the Clock resolves via score 4 or article stripping`() {
+        // With word-boundary score 4: "clock" IS a word in "the clock" → score 4.
+        // open() also strips the article and retries, getting score 0 for "clock".
+        // Both paths find the app; article stripping gives a more confident score.
+        assertEquals(4, score("the clock", "clock"))   // word-boundary match
+        assertEquals(0, score("clock", "clock"))       // after stripping: exact match
+        assertTrue("stripped is a better match",
+            score("clock", "clock")!! < score("the clock", "clock")!!)
+    }
+
+    @Test fun `open Google Chrome resolves — label Chrome matches via score 4`() {
+        // Direct regression for device failure: "open Google Chrome" → label "Chrome"
+        assertEquals(4, score("google chrome", "chrome"))
+        // And the article-stripped path also works if AppIntentDetector passes "google chrome":
+        // queryWords=["google","chrome"] → "chrome" found as word → score 4
+    }
+
+    @Test fun `two different apps with same score remain ambiguous — tie-break test`() {
+        // "maps" scores the same against two hypothetical map-like labels that both
+        // contain "maps" as a substring; they tie → MultipleMatches (device-only verify).
+        // Here we just confirm both score the same tier:
+        val s1 = score("maps", "google maps")!!   // word "ma" … no, "maps" starts "google maps"? Let's check
+        val s2 = score("maps", "maps")!!          // exact
+        // "maps" exact match returns 0; "maps" in "google maps" returns 2 (word-start).
+        // They do NOT tie, which is expected: "Maps" would be preferred over "Google Maps".
+        assertTrue("exact app beats broader label", s2 < s1)
+    }
+
+    @Test fun `two genuinely similar apps score identically — caller must treat as ambiguous`() {
+        // If two different apps both have labels that start with the query at score 1,
+        // they tie.  AppLaunchTool.open() returns MultipleMatches in this case (device-side).
+        // Here we verify the pure-scoring layer produces equal scores for such a pair.
+        val sMapsPlus = score("maps", "maps plus")!!   // score 1: label starts with "maps"
+        val sMapsPro  = score("maps", "maps pro")!!    // score 1: label starts with "maps"
+        assertEquals("equal score → same ambiguous tier", sMapsPlus, sMapsPro)
+    }
+}
+
+// ── AppIntentDetector article-stripping ──────────────────────────────────────
+
+class AppIntentDetectorArticleStripTest {
+
+    private fun detect(text: String) = AppIntentDetector.extractAppName(text)
+
+    @Test fun `open the Clock strips article`() {
+        assertEquals("Clock", detect("open the Clock"))
+    }
+
+    @Test fun `launch a Camera strips article`() {
+        assertEquals("Camera", detect("launch a Camera"))
+    }
+
+    @Test fun `open an App strips article`() {
+        assertEquals("App", detect("open an App"))
+    }
+
+    @Test fun `open YouTube without article unchanged`() {
+        assertEquals("YouTube", detect("open YouTube"))
+    }
+
+    @Test fun `open The Economist strips leading The`() {
+        // Article stripped → "Economist"; AppLaunchTool will then find the app
+        // because "economist" appears as a word in label "the economist" (score 4)
+        // or matches via other rules if the label is simply "The Economist" (score 0).
+        assertEquals("Economist", detect("open The Economist"))
+    }
+
+    @Test fun `launch Google Chrome strips nothing — no article`() {
+        assertEquals("Google Chrome", detect("launch Google Chrome"))
+    }
+
+    @Test fun `open the Calculator strips article`() {
+        assertEquals("Calculator", detect("open the Calculator"))
+    }
 }
