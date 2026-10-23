@@ -331,6 +331,33 @@ class CallIntentDetectorTest {
         assertNull(detect("call before the meeting"))
     }
 
+    // Pronouns must never be sent to ContactResolver — they need AI context
+    // resolution, and the single-fuzzy-match fix could otherwise dial a contact
+    // whose name merely *contains* the pronoun (e.g. "him" matching "Rahim").
+    @Test fun `call him returns null (pronoun must not become contact name)`() {
+        assertNull(detect("call him"))
+    }
+
+    @Test fun `call her returns null`() {
+        assertNull(detect("call her"))
+    }
+
+    @Test fun `call them returns null`() {
+        assertNull(detect("call them"))
+    }
+
+    @Test fun `call that person returns null`() {
+        assertNull(detect("call that"))
+    }
+
+    @Test fun `call someone returns null`() {
+        assertNull(detect("call someone"))
+    }
+
+    @Test fun `phone him returns null`() {
+        assertNull(detect("phone him"))
+    }
+
     @Test fun `phone number as name returns null`() {
         assertNull(detect("call 9876543210"))
     }

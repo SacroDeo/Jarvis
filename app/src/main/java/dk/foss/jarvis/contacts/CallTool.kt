@@ -305,6 +305,18 @@ object CallIntentDetector {
         "on", "in", "at", "from", "with", "without",
     )
 
+    /**
+     * English pronouns and demonstratives that must never be treated as contact
+     * names.  "call him" should fall through to the AI so the model can use
+     * conversation history to resolve the referent.  Without this guard, the
+     * single-fuzzy-match improvement in [resolveAndRouteCall] can accidentally
+     * dial a contact whose name *contains* the pronoun ("Rahim", "Ibrahim", …).
+     */
+    private val PRONOUNS = setOf(
+        "him", "her", "them", "he", "she", "they", "it",
+        "this", "that", "those", "these", "someone", "somebody",
+    )
+
     fun extractCallTarget(text: String): String? {
         val trimmed = text.trim()
         if (trimmed.isBlank()) return null
@@ -331,6 +343,9 @@ object CallIntentDetector {
                     if (nameWords[0] in STOP_WORDS) return null
                     if (nameWords.drop(1).any { it in STOP_WORDS }) return null
                 }
+
+                // Reject pronouns and demonstratives — they need AI context resolution.
+                if (name.lowercase() in PRONOUNS) return null
 
                 if (!ToolRegistry.isValidContactName(name)) return null
                 return name
