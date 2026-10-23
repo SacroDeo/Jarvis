@@ -1,7 +1,6 @@
 package dk.foss.jarvis
 
 import android.Manifest
-import android.app.KeyguardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -117,19 +116,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Appear over the lock screen and turn the display on (wake-word / assist launch). */
+    /**
+     * Appear over the lock screen and turn the display on (wake-word / assist launch).
+     *
+     * [setShowWhenLocked] allows this activity to draw on top of the keyguard window.
+     * The keyguard is NOT dismissed — the user's PIN/pattern/biometric protection
+     * remains fully engaged.  JARVIS shows on top so the user can interact by voice
+     * (or tap the on-screen mic / close buttons) without unlocking the phone first.
+     *
+     * [setTurnScreenOn] wakes the display if it was off, which is required for the
+     * wake-word path (screen off → wake word fires → display should turn on automatically).
+     *
+     * Both flags are API 27+ (minSdk is 29 so no version guard needed, but we keep
+     * the explicit check as documentation of the API level requirement).
+     *
+     * Previous implementation also called [KeyguardManager.requestDismissKeyguard],
+     * which forced a PIN/biometric challenge before JARVIS could start listening —
+     * blocking voice commands that do not require an unlocked phone (alarms, calls,
+     * spoken replies).  That call has been removed.  If a specific command later
+     * requires authenticated UI access, it can request keyguard dismissal at that
+     * point via the appropriate system API.
+     */
     private fun showOverLockScreen() {
         if (android.os.Build.VERSION.SDK_INT >= 27) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
         }
-        // Actually dismiss the keyguard so the user can interact immediately.
-        val km = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
-        km?.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-            override fun onDismissSucceeded() {}
-            override fun onDismissCancelled() {}
-            override fun onDismissError() {}
-        })
     }
 
     /** If the wake word is enabled and VoiceInteractionService is NOT active, start legacy listener. */

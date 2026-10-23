@@ -360,6 +360,11 @@ class WakeWordService : Service() {
             .setContentText("Listening for \u201cJarvis\u201d")
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            // VISIBILITY_PUBLIC: show title and text on the lock screen so the user
+            // knows JARVIS is actively listening for the wake word.  No contact names,
+            // conversation content, or other private data appear in this notification —
+            // only the static "Listening for Jarvis" text defined above.
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(open)
             .build()
     }

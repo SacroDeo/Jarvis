@@ -1,6 +1,8 @@
 package dk.foss.jarvis.ui
 
 import android.app.Application
+import android.app.KeyguardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Handler
@@ -1119,6 +1121,26 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Returns true when the device keyguard is currently engaged (any lock-screen
+     * credential is protecting the phone — PIN, pattern, password, biometric, or
+     * swipe).
+     *
+     * Used by tool-execution methods to add an honest note to the result message
+     * fed back to the AI: when an app is launched while locked, the intent fires
+     * and the target app opens, but it appears behind the lock screen and is not
+     * visible to the user until they unlock.  The AI uses this note to compose an
+     * honest spoken reply ("I've started the search — unlock your phone to see it.")
+     * rather than claiming the destination is visible.
+     *
+     * No permission required; [KeyguardManager] is a normal system service.
+     */
+    private fun isDeviceLocked(): Boolean {
+        val km = getApplication<Application>()
+            .getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        return km?.isKeyguardLocked == true
+    }
+
+    /**
      * Execute an [open_app] tool call synchronously.
      *
      * [AppLaunchTool.open] resolves the app name against installed launchable apps,
@@ -1133,11 +1155,21 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         val context = getApplication<Application>()
         val result = AppLaunchTool.open(context, appName)
         val resultMsg = when (result) {
-            is AppLaunchTool.Result.Success         -> "Tool open_app executed: opened ${result.appLabel}"
-            is AppLaunchTool.Result.NotFound        -> "Tool open_app failed: no app matching \"${result.query}\" found"
+            is AppLaunchTool.Result.Success -> {
+                // The intent was dispatched.  If the device is locked, the target app
+                // opened in the background behind the lock screen and is not visible.
+                val lockedNote = if (isDeviceLocked())
+                    " NOTE: device is locked — the app opened in the background. " +
+                        "Inform the user they may need to unlock their phone to see it."
+                else ""
+                "Tool open_app executed: opened ${result.appLabel}$lockedNote"
+            }
+            is AppLaunchTool.Result.NotFound        ->
+                "Tool open_app failed: no app matching \"${result.query}\" found"
             is AppLaunchTool.Result.MultipleMatches ->
                 "Tool open_app ambiguous: found multiple matches (${result.labels.take(3).joinToString(", ")}). Ask which one."
-            is AppLaunchTool.Result.Failure         -> "Tool open_app failed: ${result.reason}"
+            is AppLaunchTool.Result.Failure         ->
+                "Tool open_app failed: ${result.reason}"
         }
         turnToolResults.add(ChatMessage("system", resultMsg))
         pendingToolResultForModel = resultMsg
@@ -1175,8 +1207,15 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             else -> DeepLinkTool.Result.Failure("Unknown deep-link tool: $toolName")
         }
         val resultMsg = when (result) {
-            is DeepLinkTool.Result.Success     ->
-                "Tool $toolName executed: ${result.description}"
+            is DeepLinkTool.Result.Success -> {
+                // The intent was dispatched.  If the device is locked, the destination
+                // app opened behind the lock screen and is not visible to the user.
+                val lockedNote = if (isDeviceLocked())
+                    " NOTE: device is locked — the destination opened in the background. " +
+                        "Inform the user they may need to unlock their phone to see it."
+                else ""
+                "Tool $toolName executed: ${result.description}$lockedNote"
+            }
             is DeepLinkTool.Result.AppNotFound ->
                 "Tool $toolName: ${result.appName} not installed." +
                     if (result.fallbackUrl != null) " Opened browser fallback instead." else ""
