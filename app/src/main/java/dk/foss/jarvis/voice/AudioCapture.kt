@@ -43,7 +43,7 @@ class AudioCapture(private val context: Context) {
                 val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
                 val bufSize = maxOf(minBuf, SAMPLE_RATE) // ~1s internal headroom
                 record = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
                     SAMPLE_RATE, CHANNEL, ENCODING, bufSize,
                 )
                 if (record.state != AudioRecord.STATE_INITIALIZED) {
