@@ -11,6 +11,7 @@ import dk.foss.jarvis.data.ConversationRepository
 import dk.foss.jarvis.data.SettingsStore
 import dk.foss.jarvis.tools.AlarmTool
 import dk.foss.jarvis.tools.AppLaunchTool
+import dk.foss.jarvis.tools.DeepLinkTool
 import dk.foss.jarvis.voice.ContactAwarePrivacyFilter
 import dk.foss.jarvis.worker.ChatMessage
 import dk.foss.jarvis.worker.JsonSchemaResponseFormat
@@ -197,6 +198,86 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                                 is AppLaunchTool.Result.NotFound        -> "Tool open_app failed: no app found for \"${result.query}\""
                                 is AppLaunchTool.Result.MultipleMatches -> "Tool open_app ambiguous: matches ${result.labels.take(3).joinToString(", ")}"
                                 is AppLaunchTool.Result.Failure         -> "Tool open_app failed: ${result.reason}"
+                            }
+                            turnToolResults.add(ChatMessage("system", resultMsg))
+                            responseBuffer.clear()
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = true)
+                        }
+
+                        is ToolRegistry.Outcome.OpenUrlCall -> {
+                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
+                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
+                                finishStream()
+                                return@onMain
+                            }
+                            orchestrationStep++
+                            toolExecutedThisTurn = true
+                            val context = getApplication<Application>()
+                            val result = DeepLinkTool.openUrl(context, outcome.url)
+                            val resultMsg = when (result) {
+                                is DeepLinkTool.Result.Success     -> "Tool open_url executed: ${result.description}"
+                                is DeepLinkTool.Result.AppNotFound -> "Tool open_url: no handler found."
+                                is DeepLinkTool.Result.Failure     -> "Tool open_url failed: ${result.reason}"
+                            }
+                            turnToolResults.add(ChatMessage("system", resultMsg))
+                            responseBuffer.clear()
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = true)
+                        }
+
+                        is ToolRegistry.Outcome.YouTubeSearchCall -> {
+                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
+                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
+                                finishStream()
+                                return@onMain
+                            }
+                            orchestrationStep++
+                            toolExecutedThisTurn = true
+                            val context = getApplication<Application>()
+                            val result = DeepLinkTool.youtubeSearch(context, outcome.query)
+                            val resultMsg = when (result) {
+                                is DeepLinkTool.Result.Success     -> "Tool youtube_search executed: ${result.description}"
+                                is DeepLinkTool.Result.AppNotFound -> "Tool youtube_search: YouTube not installed. ${if (result.fallbackUrl != null) "Browser fallback opened." else ""}"
+                                is DeepLinkTool.Result.Failure     -> "Tool youtube_search failed: ${result.reason}"
+                            }
+                            turnToolResults.add(ChatMessage("system", resultMsg))
+                            responseBuffer.clear()
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = true)
+                        }
+
+                        is ToolRegistry.Outcome.BrowserSearchCall -> {
+                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
+                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
+                                finishStream()
+                                return@onMain
+                            }
+                            orchestrationStep++
+                            toolExecutedThisTurn = true
+                            val context = getApplication<Application>()
+                            val result = DeepLinkTool.browserSearch(context, outcome.query)
+                            val resultMsg = when (result) {
+                                is DeepLinkTool.Result.Success     -> "Tool browser_search executed: ${result.description}"
+                                is DeepLinkTool.Result.AppNotFound -> "Tool browser_search: no browser found."
+                                is DeepLinkTool.Result.Failure     -> "Tool browser_search failed: ${result.reason}"
+                            }
+                            turnToolResults.add(ChatMessage("system", resultMsg))
+                            responseBuffer.clear()
+                            requestModelTurn(workerUrl, workerToken, model, assistantIndex, allowTool = true)
+                        }
+
+                        is ToolRegistry.Outcome.SpotifyPlayCall -> {
+                            if (orchestrationStep >= MAX_ORCHESTRATION_STEPS) {
+                                repo.replaceMessage(assistantIndex, outcome.ack.ifBlank { "Done." })
+                                finishStream()
+                                return@onMain
+                            }
+                            orchestrationStep++
+                            toolExecutedThisTurn = true
+                            val context = getApplication<Application>()
+                            val result = DeepLinkTool.spotifyPlay(context, outcome.query)
+                            val resultMsg = when (result) {
+                                is DeepLinkTool.Result.Success     -> "Tool spotify_play executed: ${result.description}"
+                                is DeepLinkTool.Result.AppNotFound -> "Tool spotify_play: Spotify not installed. ${if (result.fallbackUrl != null) "Opened web player instead." else ""}"
+                                is DeepLinkTool.Result.Failure     -> "Tool spotify_play failed: ${result.reason}"
                             }
                             turnToolResults.add(ChatMessage("system", resultMsg))
                             responseBuffer.clear()

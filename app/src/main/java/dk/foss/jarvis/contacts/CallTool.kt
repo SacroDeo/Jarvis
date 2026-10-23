@@ -37,6 +37,10 @@ data class AssistantEnvelope(
     val alarm_label: String = "",
     // open_app
     val app_name: String = "",
+    // open_url
+    val url: String = "",
+    // youtube_search / browser_search / spotify_play
+    val search_query: String = "",
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,15 +51,21 @@ object ToolRegistry {
 
     // ── tool name constants ───────────────────────────────────────────────────
 
-    const val TOOL_NONE          = "none"
-    const val TOOL_CALL_CONTACT  = "call_contact"
-    const val TOOL_SET_ALARM     = "set_alarm"
-    const val TOOL_OPEN_APP      = "open_app"
+    const val TOOL_NONE           = "none"
+    const val TOOL_CALL_CONTACT   = "call_contact"
+    const val TOOL_SET_ALARM      = "set_alarm"
+    const val TOOL_OPEN_APP       = "open_app"
+    const val TOOL_OPEN_URL       = "open_url"
+    const val TOOL_YOUTUBE_SEARCH = "youtube_search"
+    const val TOOL_BROWSER_SEARCH = "browser_search"
+    const val TOOL_SPOTIFY_PLAY   = "spotify_play"
 
-    private const val MAX_CONTACT_NAME_LEN   = 60
-    private const val MAX_CONTACT_NAME_DIGITS = 6
-    private const val MAX_LABEL_LEN           = 120
-    private const val MAX_APP_NAME_LEN        = 80
+    private const val MAX_CONTACT_NAME_LEN    = 60
+    private const val MAX_CONTACT_NAME_DIGITS  = 6
+    private const val MAX_LABEL_LEN            = 120
+    private const val MAX_APP_NAME_LEN         = 80
+    private const val MAX_URL_LEN              = 2048
+    private const val MAX_SEARCH_QUERY_LEN     = 200
 
     // ── JSON schema ───────────────────────────────────────────────────────────
 
@@ -71,8 +81,10 @@ object ToolRegistry {
             putJsonObject("tool") {
                 put("type", "string")
                 putJsonArray("enum") {
-                    add(TOOL_NONE); add(TOOL_CALL_CONTACT)
-                    add(TOOL_SET_ALARM); add(TOOL_OPEN_APP)
+                    add(TOOL_NONE);           add(TOOL_CALL_CONTACT)
+                    add(TOOL_SET_ALARM);      add(TOOL_OPEN_APP)
+                    add(TOOL_OPEN_URL);       add(TOOL_YOUTUBE_SEARCH)
+                    add(TOOL_BROWSER_SEARCH); add(TOOL_SPOTIFY_PLAY)
                 }
             }
             putJsonObject("contact_name") { put("type", "string") }
@@ -80,11 +92,13 @@ object ToolRegistry {
             putJsonObject("alarm_minute") { put("type", "integer") }
             putJsonObject("alarm_label")  { put("type", "string") }
             putJsonObject("app_name")     { put("type", "string") }
+            putJsonObject("url")          { put("type", "string") }
+            putJsonObject("search_query") { put("type", "string") }
         }
         putJsonArray("required") {
             add("reply"); add("tool"); add("contact_name")
             add("alarm_hour"); add("alarm_minute"); add("alarm_label")
-            add("app_name")
+            add("app_name"); add("url"); add("search_query")
         }
         put("additionalProperties", false)
     }
@@ -106,25 +120,37 @@ object ToolRegistry {
         You are Jarvis, a personal voice assistant running on an Android phone.
 
         You can perform these actions:
-        • call_contact — start a phone call to a named person
-        • set_alarm    — set a timed alarm or reminder
-        • open_app     — open an installed Android application
-        • none         — reply conversationally without taking an action
+        • call_contact   — start a phone call to a named person
+        • set_alarm      — set a timed alarm or reminder
+        • open_app       — open an installed Android application by its display name
+        • open_url       — open a specific website URL in the device browser
+        • youtube_search — open YouTube showing search results for a song, video, or topic
+        • browser_search — open the device browser with a web search
+        • spotify_play   — open Spotify with a search for a song, artist, or playlist
+        • none           — reply conversationally without taking an action
 
         Always respond with a single JSON object containing ALL of these fields:
           "reply"        — short spoken sentence (always required)
-          "tool"         — one of the four values above
+          "tool"         — one of the eight values above
           "contact_name" — the contact's name (call_contact only, else "")
           "alarm_hour"   — hour 0–23 as an integer (set_alarm only, else 0)
           "alarm_minute" — minute 0–59 as an integer (set_alarm only, else 0)
           "alarm_label"  — alarm description (set_alarm only, else "")
-          "app_name"     — app name to open (open_app only, else "")
+          "app_name"     — app label to open (open_app only, else "")
+          "url"          — full URL to open, e.g. "https://example.com" (open_url only, else "")
+          "search_query" — search term or song/artist name (youtube_search, browser_search, spotify_play only, else "")
 
         Rules:
         - Use call_contact only when the user explicitly wants to phone a specific person.
         - Use set_alarm only when a time is clearly specified; if the time is missing, ask
           for it in reply and set tool to "none".
-        - Use open_app only when the user wants to launch an app.
+        - Use open_app only when the user wants to open an app by name and nothing more.
+        - Use youtube_search when the user wants to find or play a video/song on YouTube.
+          Do NOT use open_app + youtube_search together; youtube_search opens YouTube directly.
+        - Use browser_search when the user wants to search the web (e.g. "search for Linux commands").
+          Do NOT use open_app + browser_search; browser_search opens the browser with the search.
+        - Use spotify_play when the user wants to play music on Spotify.
+        - Use open_url when the user gives a specific URL or says "open [website]" with a domain name.
         - For all other requests use tool "none" and reply conversationally.
         - Phone numbers and contact details never appear in your output — the device
           resolves them locally.
@@ -136,14 +162,16 @@ object ToolRegistry {
           mention, use the name from the conversation history as contact_name.
         - Multi-step requests: you may be called multiple times in a single turn. Each call
           handles ONE action. After you select a tool and the device executes it, you will
-          receive the result and can choose the next action. Use this to handle requests like
-          "Open YouTube and set an alarm for 7 AM" — first call: open YouTube, second call:
-          set alarm. Only use tool "none" when all actions in the request are complete.
+          receive the result and can choose the next action. Only use tool "none" when all
+          actions in the request are complete.
         - Keep every reply short and natural — it will be spoken aloud.
         - If a request is ambiguous, ask for clarification in reply.
         - For set_alarm and open_app: the system tells you whether the Android intent was
           accepted, NOT whether the action was confirmed by the app. Reply honestly:
           say "I've asked your Clock app to set an alarm" rather than "Your alarm is set."
+        - For youtube_search, browser_search, spotify_play, open_url: the app or page was
+          opened but playback or navigation has not been confirmed. Do not say "now playing"
+          or "playing"; say "I've opened YouTube with a search for..." or similar.
         - If the tool result says it failed, explain that honestly rather than claiming success.
     """.trimIndent()
 
@@ -170,6 +198,18 @@ object ToolRegistry {
 
         /** Model wants to open an app. */
         data class OpenAppCall(val appName: String, val ack: String) : Outcome()
+
+        /** Model wants to open a specific URL in the browser. */
+        data class OpenUrlCall(val url: String, val ack: String) : Outcome()
+
+        /** Model wants to search YouTube for a video or song. */
+        data class YouTubeSearchCall(val query: String, val ack: String) : Outcome()
+
+        /** Model wants to perform a web search in the browser. */
+        data class BrowserSearchCall(val query: String, val ack: String) : Outcome()
+
+        /** Model wants to search and play music on Spotify. */
+        data class SpotifyPlayCall(val query: String, val ack: String) : Outcome()
 
         /** Malformed / policy-violating response — fail closed. */
         object Invalid : Outcome()
@@ -229,6 +269,38 @@ object ToolRegistry {
             if (appName.isEmpty() || appName.length > MAX_APP_NAME_LEN) return Outcome.Invalid
             if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
             return Outcome.OpenAppCall(appName = appName, ack = reply)
+        }
+
+        // ── open_url ──────────────────────────────────────────────────────────
+        if (tool == TOOL_OPEN_URL) {
+            val url = envelope.url.trim()
+            if (url.isEmpty() || url.length > MAX_URL_LEN) return Outcome.Invalid
+            if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
+            return Outcome.OpenUrlCall(url = url, ack = reply)
+        }
+
+        // ── youtube_search ────────────────────────────────────────────────────
+        if (tool == TOOL_YOUTUBE_SEARCH) {
+            val query = envelope.search_query.trim()
+            if (query.isEmpty() || query.length > MAX_SEARCH_QUERY_LEN) return Outcome.Invalid
+            if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
+            return Outcome.YouTubeSearchCall(query = query, ack = reply)
+        }
+
+        // ── browser_search ────────────────────────────────────────────────────
+        if (tool == TOOL_BROWSER_SEARCH) {
+            val query = envelope.search_query.trim()
+            if (query.isEmpty() || query.length > MAX_SEARCH_QUERY_LEN) return Outcome.Invalid
+            if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
+            return Outcome.BrowserSearchCall(query = query, ack = reply)
+        }
+
+        // ── spotify_play ──────────────────────────────────────────────────────
+        if (tool == TOOL_SPOTIFY_PLAY) {
+            val query = envelope.search_query.trim()
+            if (query.isEmpty() || query.length > MAX_SEARCH_QUERY_LEN) return Outcome.Invalid
+            if (!allowTool) return if (reply.isNotEmpty()) Outcome.Reply(reply) else Outcome.Invalid
+            return Outcome.SpotifyPlayCall(query = query, ack = reply)
         }
 
         // Unknown tool — fail closed.
@@ -413,12 +485,22 @@ object CallFlowPolicy {
     }
 
     fun parseOrdinal(text: String): Int? {
-        val n = normalizeAnswer(text)
+        var n = normalizeAnswer(text)
+        // Strip trailing " one" so "second one" → "second", "third one" → "third".
+        // This handles natural replies like "the second one" (normalizeAnswer strips
+        // the leading "the ", this strips the trailing " one").
+        if (n.endsWith(" one") && n.length > 4) n = n.removeSuffix(" one").trim()
         return when (n) {
-            "one", "1"   -> 1; "two", "2"   -> 2; "three", "3" -> 3
-            "four", "4"  -> 4; "five", "5"  -> 5; "six", "6"   -> 6
-            "seven", "7" -> 7; "eight", "8" -> 8; "nine", "9"  -> 9
-            "ten", "10"  -> 10
+            "first",   "1st", "one",   "1"  -> 1
+            "second",  "2nd", "two",   "2"  -> 2
+            "third",   "3rd", "three", "3"  -> 3
+            "fourth",  "4th", "four",  "4"  -> 4
+            "fifth",   "5th", "five",  "5"  -> 5
+            "sixth",   "6th", "six",   "6"  -> 6
+            "seventh", "7th", "seven", "7"  -> 7
+            "eighth",  "8th", "eight", "8"  -> 8
+            "ninth",   "9th", "nine",  "9"  -> 9
+            "tenth",   "10th","ten",   "10" -> 10
             else -> null
         }
     }

@@ -22,6 +22,7 @@ import dk.foss.jarvis.data.SettingsStore
 import dk.foss.jarvis.tools.AlarmTool
 import dk.foss.jarvis.tools.AppIntentDetector
 import dk.foss.jarvis.tools.AppLaunchTool
+import dk.foss.jarvis.tools.DeepLinkTool
 import dk.foss.jarvis.voice.AndroidTts
 import dk.foss.jarvis.voice.AudioFocusHold
 import dk.foss.jarvis.voice.ContactAwarePrivacyFilter
@@ -1014,6 +1015,34 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 reply.value = outcome.ack.ifBlank { "Opening app…" }
                 executeOpenAppTool(outcome.appName, myTurn)
             }
+            is ToolRegistry.Outcome.OpenUrlCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Opening that page…" }
+                executeDeepLinkTool(ToolRegistry.TOOL_OPEN_URL, outcome.url, "", myTurn)
+            }
+            is ToolRegistry.Outcome.YouTubeSearchCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Searching YouTube…" }
+                executeDeepLinkTool(ToolRegistry.TOOL_YOUTUBE_SEARCH, "", outcome.query, myTurn)
+            }
+            is ToolRegistry.Outcome.BrowserSearchCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Searching the web…" }
+                executeDeepLinkTool(ToolRegistry.TOOL_BROWSER_SEARCH, "", outcome.query, myTurn)
+            }
+            is ToolRegistry.Outcome.SpotifyPlayCall -> {
+                lastOutcomeWasReply = false
+                main.removeCallbacks(idleFlush)
+                main.removeCallbacks(stallIndicator)
+                reply.value = outcome.ack.ifBlank { "Opening Spotify…" }
+                executeDeepLinkTool(ToolRegistry.TOOL_SPOTIFY_PLAY, "", outcome.query, myTurn)
+            }
             is ToolRegistry.Outcome.Invalid -> {
                 lastOutcomeWasReply = false
                 // Fail closed: no tool execution, no speech from a malformed envelope.
@@ -1115,6 +1144,51 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
         reply.value = when (result) {
             is AppLaunchTool.Result.Success -> "Opening ${result.appLabel}…"
             else                            -> "Having trouble opening that app…"
+        }
+    }
+
+    /**
+     * Execute a deep-link tool call (open_url, youtube_search, browser_search, spotify_play).
+     *
+     * [toolName] identifies which [DeepLinkTool] function to call.
+     * [url] carries the URL for open_url; [query] carries the search term for the others.
+     *
+     * The result is stored in [turnToolResults] and [pendingToolResultForModel] so the
+     * existing [continueWithToolResult] loop can generate a natural spoken follow-up.
+     *
+     * Privacy: [url] and [query] arrive from the AI's structured JSON envelope already
+     * constrained by the schema, and are dispatched directly to an Android intent without
+     * being transmitted back to the Worker or any network service.
+     *
+     * Honesty: we report only that the intent was dispatched — NOT that playback started
+     * or that the target page was successfully loaded. The follow-up model prompt includes
+     * the result description so the AI can compose an honest spoken reply.
+     */
+    private fun executeDeepLinkTool(toolName: String, url: String, query: String, myTurn: Int) {
+        if (turn != myTurn) return
+        val context = getApplication<Application>()
+        val result = when (toolName) {
+            ToolRegistry.TOOL_OPEN_URL       -> DeepLinkTool.openUrl(context, url)
+            ToolRegistry.TOOL_YOUTUBE_SEARCH -> DeepLinkTool.youtubeSearch(context, query)
+            ToolRegistry.TOOL_BROWSER_SEARCH -> DeepLinkTool.browserSearch(context, query)
+            ToolRegistry.TOOL_SPOTIFY_PLAY   -> DeepLinkTool.spotifyPlay(context, query)
+            else -> DeepLinkTool.Result.Failure("Unknown deep-link tool: $toolName")
+        }
+        val resultMsg = when (result) {
+            is DeepLinkTool.Result.Success     ->
+                "Tool $toolName executed: ${result.description}"
+            is DeepLinkTool.Result.AppNotFound ->
+                "Tool $toolName: ${result.appName} not installed." +
+                    if (result.fallbackUrl != null) " Opened browser fallback instead." else ""
+            is DeepLinkTool.Result.Failure     ->
+                "Tool $toolName failed: ${result.reason}"
+        }
+        turnToolResults.add(ChatMessage("system", resultMsg))
+        pendingToolResultForModel = resultMsg
+        reply.value = when (result) {
+            is DeepLinkTool.Result.Success     -> result.description.trimEnd('.')
+            is DeepLinkTool.Result.AppNotFound -> "${result.appName} isn't installed…"
+            is DeepLinkTool.Result.Failure     -> "Having trouble with that…"
         }
     }
 

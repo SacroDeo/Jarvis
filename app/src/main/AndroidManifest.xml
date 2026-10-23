@@ -29,12 +29,26 @@
         returns the full list of installed launchable apps regardless of OEM customisations
         (e.g. Realme ColorOS).  Without this, AppLaunchTool.queryLaunchableApps() can
         return an empty list, making every "open X" request fail silently.
+
+        The ACTION_VIEW/https intent entry lets DeepLinkTool resolve which apps can handle
+        HTTPS URLs (browsers, YouTube, etc.) on Android 11+.  The explicit package entries
+        for YouTube and Spotify are required so that setPackage() calls in DeepLinkTool work
+        even when those apps are not the default handler for the https scheme.
     -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- DeepLinkTool: resolve browser and app handlers for HTTPS URLs -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <!-- DeepLinkTool: YouTube app direct launch via setPackage() -->
+        <package android:name="com.google.android.youtube" />
+        <!-- DeepLinkTool: Spotify app deep link via setPackage() -->
+        <package android:name="com.spotify.music" />
     </queries>
 
     <application

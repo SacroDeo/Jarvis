@@ -986,3 +986,354 @@ class OrchestrationLoopTest {
         assertTrue(ToolRegistry.MULTI_TOOL_SCHEMA === ToolRegistry.CALL_ENVELOPE_SCHEMA)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 1A: ordinal word parsing — "first", "second", "the third one", etc.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Tests for the extended [CallFlowPolicy.parseOrdinal] that now accepts ordinal words
+ * ("first", "second", "third", …) in addition to the original cardinal forms ("one",
+ * "two", "three", …) and digits.  Covers the acceptance-test requirement that replies
+ * like "the second one" and "the third one" correctly select a pending contact candidate.
+ */
+class OrdinalParsingTest {
+
+    // ── existing cardinal forms must still work ───────────────────────────────
+
+    @Test fun `cardinal one still maps to 1`() {
+        assertEquals(1, CallFlowPolicy.parseOrdinal("one"))
+    }
+
+    @Test fun `cardinal two still maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("two"))
+    }
+
+    @Test fun `cardinal ten still maps to 10`() {
+        assertEquals(10, CallFlowPolicy.parseOrdinal("ten"))
+    }
+
+    @Test fun `digit string still maps to its value`() {
+        assertEquals(3, CallFlowPolicy.parseOrdinal("3"))
+        assertEquals(7, CallFlowPolicy.parseOrdinal("7"))
+    }
+
+    // ── new ordinal word forms ────────────────────────────────────────────────
+
+    @Test fun `first maps to 1`() {
+        assertEquals(1, CallFlowPolicy.parseOrdinal("first"))
+    }
+
+    @Test fun `second maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("second"))
+    }
+
+    @Test fun `third maps to 3`() {
+        assertEquals(3, CallFlowPolicy.parseOrdinal("third"))
+    }
+
+    @Test fun `fourth maps to 4`() {
+        assertEquals(4, CallFlowPolicy.parseOrdinal("fourth"))
+    }
+
+    @Test fun `fifth maps to 5`() {
+        assertEquals(5, CallFlowPolicy.parseOrdinal("fifth"))
+    }
+
+    @Test fun `sixth maps to 6`() {
+        assertEquals(6, CallFlowPolicy.parseOrdinal("sixth"))
+    }
+
+    @Test fun `seventh maps to 7`() {
+        assertEquals(7, CallFlowPolicy.parseOrdinal("seventh"))
+    }
+
+    @Test fun `eighth maps to 8`() {
+        assertEquals(8, CallFlowPolicy.parseOrdinal("eighth"))
+    }
+
+    @Test fun `ninth maps to 9`() {
+        assertEquals(9, CallFlowPolicy.parseOrdinal("ninth"))
+    }
+
+    @Test fun `tenth maps to 10`() {
+        assertEquals(10, CallFlowPolicy.parseOrdinal("tenth"))
+    }
+
+    // ── suffix forms (1st, 2nd, 3rd, …) ──────────────────────────────────────
+
+    @Test fun `1st maps to 1`() {
+        assertEquals(1, CallFlowPolicy.parseOrdinal("1st"))
+    }
+
+    @Test fun `2nd maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("2nd"))
+    }
+
+    @Test fun `3rd maps to 3`() {
+        assertEquals(3, CallFlowPolicy.parseOrdinal("3rd"))
+    }
+
+    @Test fun `4th maps to 4`() {
+        assertEquals(4, CallFlowPolicy.parseOrdinal("4th"))
+    }
+
+    // ── "the X one" natural speech forms — acceptance test requirements ───────
+
+    @Test fun `the second one maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("the second one"))
+    }
+
+    @Test fun `the third one maps to 3`() {
+        assertEquals(3, CallFlowPolicy.parseOrdinal("the third one"))
+    }
+
+    @Test fun `the first one maps to 1`() {
+        assertEquals(1, CallFlowPolicy.parseOrdinal("the first one"))
+    }
+
+    @Test fun `the fourth one maps to 4`() {
+        assertEquals(4, CallFlowPolicy.parseOrdinal("the fourth one"))
+    }
+
+    // ── "number X" still works (normalizeAnswer strips "number ") ────────────
+
+    @Test fun `number two still maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("number two"))
+    }
+
+    @Test fun `number three still maps to 3`() {
+        assertEquals(3, CallFlowPolicy.parseOrdinal("number three"))
+    }
+
+    // ── case insensitivity ────────────────────────────────────────────────────
+
+    @Test fun `SECOND uppercase maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("SECOND"))
+    }
+
+    @Test fun `The Second One mixed-case maps to 2`() {
+        assertEquals(2, CallFlowPolicy.parseOrdinal("The Second One"))
+    }
+
+    // ── out-of-range inputs must return null ─────────────────────────────────
+
+    @Test fun `eleventh returns null — above supported range`() {
+        assertNull(CallFlowPolicy.parseOrdinal("eleventh"))
+    }
+
+    @Test fun `eleven returns null`() {
+        assertNull(CallFlowPolicy.parseOrdinal("eleven"))
+    }
+
+    @Test fun `zero returns null`() {
+        assertNull(CallFlowPolicy.parseOrdinal("zero"))
+    }
+
+    @Test fun `arbitrary word returns null`() {
+        assertNull(CallFlowPolicy.parseOrdinal("call"))
+        assertNull(CallFlowPolicy.parseOrdinal("yes"))
+        assertNull(CallFlowPolicy.parseOrdinal("maybe"))
+    }
+
+    @Test fun `empty string returns null`() {
+        assertNull(CallFlowPolicy.parseOrdinal(""))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 1A: deep-link tool schema — open_url, youtube_search, browser_search,
+// spotify_play parsing through ToolRegistry.parse()
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Schema-level parsing tests for the four new deep-link tools.
+ *
+ * Verifies that [ToolRegistry.parse] produces the correct [ToolRegistry.Outcome]
+ * subtypes, that validation rejects malformed inputs (empty query, over-length URL),
+ * and that `allowTool=false` correctly downgrades tool calls to [ToolRegistry.Outcome.Reply].
+ *
+ * Intent-dispatch behavior (context, ActivityNotFoundException, etc.) is device-only.
+ */
+class DeepLinkToolSchemaTest {
+
+    // Helper: build a minimal valid envelope JSON with the new fields
+    private fun envelope(
+        reply: String = "ok",
+        tool: String = "none",
+        url: String = "",
+        searchQuery: String = "",
+    ) = """{"reply":"$reply","tool":"$tool","contact_name":"","alarm_hour":0,""" +
+        """"alarm_minute":0,"alarm_label":"","app_name":"","url":"$url","search_query":"$searchQuery"}"""
+
+    private fun parse(json: String, allowTool: Boolean = true) =
+        ToolRegistry.parse(json, allowTool)
+
+    // ── system prompt contains new tool names ─────────────────────────────────
+
+    @Test fun `system prompt mentions youtube_search`() {
+        assertTrue(ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT.contains("youtube_search"))
+    }
+
+    @Test fun `system prompt mentions browser_search`() {
+        assertTrue(ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT.contains("browser_search"))
+    }
+
+    @Test fun `system prompt mentions spotify_play`() {
+        assertTrue(ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT.contains("spotify_play"))
+    }
+
+    @Test fun `system prompt mentions open_url`() {
+        assertTrue(ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT.contains("open_url"))
+    }
+
+    @Test fun `system prompt advises not to claim playback confirmed`() {
+        val prompt = ToolRegistry.MULTI_TOOL_SYSTEM_PROMPT
+        assertTrue("Prompt must warn about not claiming playback",
+            prompt.contains("playback") || prompt.contains("now playing"))
+    }
+
+    // ── schema contains new fields and tool names ─────────────────────────────
+
+    @Test fun `schema properties contain url field`() {
+        val props = ToolRegistry.MULTI_TOOL_SCHEMA["properties"].toString()
+        assertTrue(props.contains("\"url\""))
+    }
+
+    @Test fun `schema properties contain search_query field`() {
+        val props = ToolRegistry.MULTI_TOOL_SCHEMA["properties"].toString()
+        assertTrue(props.contains("\"search_query\""))
+    }
+
+    @Test fun `schema required array contains url`() {
+        val required = ToolRegistry.MULTI_TOOL_SCHEMA["required"].toString()
+        assertTrue(required.contains("\"url\""))
+    }
+
+    @Test fun `schema required array contains search_query`() {
+        val required = ToolRegistry.MULTI_TOOL_SCHEMA["required"].toString()
+        assertTrue(required.contains("\"search_query\""))
+    }
+
+    // ── open_url ──────────────────────────────────────────────────────────────
+
+    @Test fun `open_url with valid URL returns OpenUrlCall`() {
+        val out = parse(envelope(reply = "Opening it", tool = "open_url", url = "https://example.com"))
+        assertTrue(out is ToolRegistry.Outcome.OpenUrlCall)
+        val call = out as ToolRegistry.Outcome.OpenUrlCall
+        assertEquals("https://example.com", call.url)
+        assertEquals("Opening it", call.ack)
+    }
+
+    @Test fun `open_url with empty url is Invalid`() {
+        val out = parse(envelope(tool = "open_url", url = ""))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    @Test fun `open_url with url exceeding max length is Invalid`() {
+        val out = parse(envelope(tool = "open_url", url = "https://example.com/" + "a".repeat(2048)))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    @Test fun `open_url with allowTool=false downgrades to Reply`() {
+        val out = parse(envelope(reply = "Opening it", tool = "open_url", url = "https://example.com"), allowTool = false)
+        assertTrue(out is ToolRegistry.Outcome.Reply)
+        assertEquals("Opening it", (out as ToolRegistry.Outcome.Reply).text)
+    }
+
+    // ── youtube_search ────────────────────────────────────────────────────────
+
+    @Test fun `youtube_search with query returns YouTubeSearchCall`() {
+        val out = parse(envelope(reply = "Searching YouTube", tool = "youtube_search", searchQuery = "Alan Walker Faded"))
+        assertTrue(out is ToolRegistry.Outcome.YouTubeSearchCall)
+        val call = out as ToolRegistry.Outcome.YouTubeSearchCall
+        assertEquals("Alan Walker Faded", call.query)
+        assertEquals("Searching YouTube", call.ack)
+    }
+
+    @Test fun `youtube_search with empty query is Invalid`() {
+        val out = parse(envelope(tool = "youtube_search", searchQuery = ""))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    @Test fun `youtube_search with very long query is Invalid`() {
+        val out = parse(envelope(tool = "youtube_search", searchQuery = "x".repeat(201)))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    @Test fun `youtube_search with allowTool=false downgrades to Reply`() {
+        val out = parse(envelope(reply = "Let me search", tool = "youtube_search", searchQuery = "test"), allowTool = false)
+        assertTrue(out is ToolRegistry.Outcome.Reply)
+        assertEquals("Let me search", (out as ToolRegistry.Outcome.Reply).text)
+    }
+
+    // ── browser_search ────────────────────────────────────────────────────────
+
+    @Test fun `browser_search with query returns BrowserSearchCall`() {
+        val out = parse(envelope(reply = "Searching the web", tool = "browser_search", searchQuery = "Linux commands"))
+        assertTrue(out is ToolRegistry.Outcome.BrowserSearchCall)
+        val call = out as ToolRegistry.Outcome.BrowserSearchCall
+        assertEquals("Linux commands", call.query)
+        assertEquals("Searching the web", call.ack)
+    }
+
+    @Test fun `browser_search with empty query is Invalid`() {
+        val out = parse(envelope(tool = "browser_search", searchQuery = ""))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    @Test fun `browser_search with allowTool=false downgrades to Reply`() {
+        val out = parse(envelope(reply = "Let me search", tool = "browser_search", searchQuery = "test"), allowTool = false)
+        assertTrue(out is ToolRegistry.Outcome.Reply)
+    }
+
+    // ── spotify_play ──────────────────────────────────────────────────────────
+
+    @Test fun `spotify_play with query returns SpotifyPlayCall`() {
+        val out = parse(envelope(reply = "Opening Spotify", tool = "spotify_play", searchQuery = "workout playlist"))
+        assertTrue(out is ToolRegistry.Outcome.SpotifyPlayCall)
+        val call = out as ToolRegistry.Outcome.SpotifyPlayCall
+        assertEquals("workout playlist", call.query)
+        assertEquals("Opening Spotify", call.ack)
+    }
+
+    @Test fun `spotify_play with empty query is Invalid`() {
+        val out = parse(envelope(tool = "spotify_play", searchQuery = ""))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    @Test fun `spotify_play with allowTool=false downgrades to Reply`() {
+        val out = parse(envelope(reply = "Opening Spotify", tool = "spotify_play", searchQuery = "test"), allowTool = false)
+        assertTrue(out is ToolRegistry.Outcome.Reply)
+    }
+
+    // ── unknown tool still rejected ───────────────────────────────────────────
+
+    @Test fun `send_sms still produces Invalid after schema extension`() {
+        val out = parse(envelope(tool = "send_sms"))
+        assertTrue(out is ToolRegistry.Outcome.Invalid)
+    }
+
+    // ── existing tools unaffected by schema extension ─────────────────────────
+
+    @Test fun `open_app still works with extended schema`() {
+        val json = """{"reply":"Opening Maps","tool":"open_app","contact_name":"","alarm_hour":0,"alarm_minute":0,"alarm_label":"","app_name":"Maps","url":"","search_query":""}"""
+        val out = parse(json)
+        assertTrue(out is ToolRegistry.Outcome.OpenAppCall)
+        assertEquals("Maps", (out as ToolRegistry.Outcome.OpenAppCall).appName)
+    }
+
+    @Test fun `set_alarm still works with extended schema`() {
+        val json = """{"reply":"Setting alarm","tool":"set_alarm","contact_name":"","alarm_hour":7,"alarm_minute":30,"alarm_label":"Study","app_name":"","url":"","search_query":""}"""
+        val out = parse(json)
+        assertTrue(out is ToolRegistry.Outcome.SetAlarmCall)
+        assertEquals(7, (out as ToolRegistry.Outcome.SetAlarmCall).hour)
+    }
+
+    @Test fun `existing partial JSON without new fields still parses via defaults`() {
+        // Old JSON without url/search_query uses field defaults — must not break.
+        val json = """{"reply":"Hello","tool":"none","contact_name":"","alarm_hour":0,"alarm_minute":0,"alarm_label":"","app_name":""}"""
+        val out = parse(json)
+        assertTrue(out is ToolRegistry.Outcome.Reply)
+    }
+}
