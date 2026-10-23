@@ -348,6 +348,10 @@ object CallIntentDetector {
                 if (name.lowercase() in PRONOUNS) return null
 
                 if (!ToolRegistry.isValidContactName(name)) return null
+                // Diagnostic: log the extracted name (not a phone number — safe to log).
+                // Use "adb logcat -s JarvisCallIntent" to verify STT delivered the expected name.
+                android.util.Log.d("JarvisCallIntent",
+                    "extractCallTarget: prefix='$prefix' → name='$name' (${name.length} chars)")
                 return name
             }
         }

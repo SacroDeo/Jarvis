@@ -46,12 +46,18 @@ object AppLaunchTool {
         val pm = context.packageManager
         val launchables: List<ResolveInfo> = queryLaunchableApps(pm)
         if (launchables.isEmpty()) {
-            Log.w(TAG, "No launchable apps found")
+            Log.w(TAG, "queryLaunchableApps returned empty — package visibility may be restricted " +
+                "(check <queries> in AndroidManifest.xml, targetSdk=${context.applicationInfo.targetSdkVersion})")
             return Result.Failure("Could not read installed apps.")
         }
+        Log.d(TAG, "queryLaunchableApps found ${launchables.size} apps, " +
+            "matching against query='${query.take(30)}'")
 
         val ranked = rank(query.lowercase(), launchables, pm)
-        if (ranked.isEmpty()) return Result.NotFound(query)
+        if (ranked.isEmpty()) {
+            Log.i(TAG, "No app matched query='${query.take(30)}' (total apps scanned: ${launchables.size})")
+            return Result.NotFound(query)
+        }
 
         // If the top-ranked bucket has multiple ties, ask the user to pick one.
         val topScore = ranked[0].second

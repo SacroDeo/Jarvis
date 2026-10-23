@@ -264,12 +264,21 @@ object ContactResolver {
         fun load(pairs: List<Pair<Long, String>>): List<ContactCandidate> =
             pairs.map { (id, name) -> ContactCandidate(id, name, loadNumbers(context, id)) }
 
-        return when {
+        val result = when {
             exactPairs.size == 1  -> LookupResult.ExactUnique(load(exactPairs)[0])
             exactPairs.size > 1   -> LookupResult.ExactAmbiguous(load(exactPairs.take(MAX_RESULTS)))
             fuzzyPairs.isNotEmpty() -> LookupResult.FuzzyMatches(load(fuzzyPairs))
             else -> LookupResult.NotFound
         }
+        // Diagnostic log — reports result tier and match counts without exposing names.
+        // Use adb logcat tag JarvisContacts to diagnose "contact not found" failures.
+        // If result is NotFound but the contact exists, check: (a) LIKE substring match
+        // requires the query to appear verbatim in the stored name — a speech-recognition
+        // simplification (e.g. "Papa" vs stored "Pappa") will miss it; (b) non-ASCII
+        // stored names are not matched by ASCII queries.
+        Log.i(TAG, "lookup(len=${q.length}): exactMatches=${exactPairs.size} " +
+            "fuzzyMatches=${fuzzyPairs.size} result=${result::class.simpleName}")
+        return result
     }
 
     /**

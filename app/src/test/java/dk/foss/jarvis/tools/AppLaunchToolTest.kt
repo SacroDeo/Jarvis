@@ -159,4 +159,25 @@ class AppLaunchToolScoreMatchTest {
         val s = score("go", "google")
         assertEquals(1, s)
     }
+
+    // ── Real-world exact matches that were failing on Realme 8 ────────────────
+    // These verify scoreMatch works correctly for common app names; the root
+    // cause on-device was queryLaunchableApps() returning empty (fixed by
+    // adding <queries> to AndroidManifest.xml for Android 11+ visibility).
+
+    @Test fun `youtube exact match scores 0`() {
+        assertEquals(0, score("youtube", "youtube"))
+    }
+
+    @Test fun `spotify exact match scores 0`() {
+        assertEquals(0, score("spotify", "spotify"))
+    }
+
+    @Test fun `query youtube matches label YouTube exact`() {
+        assertEquals(0, score("youtube", "youtube"))
+    }
+
+    @Test fun `null returned for empty query (guard added earlier)`() {
+        assertNull(score("", "youtube"))
+    }
 }

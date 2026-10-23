@@ -710,7 +710,9 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
         val filterResult = privacyFilter.filter(rawText)
         val sanitizedText = filterResult.sanitizedText
-        repo.addMessage("user", sanitizedText)
+        // NOTE: do NOT call repo.addMessage("user", ...) here.
+        // On success we add it explicitly below.  On failure, think() adds it — adding
+        // it here too would create a duplicate user message in history.
 
         val context = getApplication<Application>()
         val result = AppLaunchTool.open(context, appName)
@@ -723,7 +725,8 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
 
         when (result) {
             is AppLaunchTool.Result.Success -> {
-                // App launched — confirm briefly and continue the conversation.
+                // App launched — add both sides of the exchange to history, then confirm.
+                repo.addMessage("user", sanitizedText)
                 val ack = "Opening ${result.appLabel}."
                 repo.addMessage("assistant", ack)
                 viewModelScope.launch { repo.persist() }
@@ -732,11 +735,11 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                 pump()
             }
             is AppLaunchTool.Result.MultipleMatches -> {
-                // Ambiguous name — ask the AI to clarify or try the first match.
+                // Ambiguous name — AI handles clarification; think() adds the user message.
                 think(rawText)
             }
             else -> {
-                // Not found or failure — let the AI handle it (may ask the user).
+                // Not found or failure — AI handles it; think() adds the user message.
                 think(rawText)
             }
         }

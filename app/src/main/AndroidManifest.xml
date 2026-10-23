@@ -23,6 +23,20 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!--
+        On Android 11+ (targetSdk 30+) the system filters PackageManager results by default.
+        Declaring the MAIN+LAUNCHER intent in <queries> ensures queryIntentActivities()
+        returns the full list of installed launchable apps regardless of OEM customisations
+        (e.g. Realme ColorOS).  Without this, AppLaunchTool.queryLaunchableApps() can
+        return an empty list, making every "open X" request fail silently.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
