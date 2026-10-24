@@ -529,4 +529,90 @@ object CallFlowPolicy {
 
     fun confirmPrompt(contactName: String, label: String): String =
         "Call $contactName on $label? Say yes to confirm, or no to cancel."
+
+    // ── Phase A: phonetic-match prompts ───────────────────────────────────────
+
+    /**
+     * Prompt for a single phonetic / low-confidence candidate.
+     *
+     * Always shown even for one result — phonetic matches are NEVER auto-dialled.
+     * The user must confirm explicitly before the call is placed.
+     */
+    fun phoneticMatchPrompt(name: String): String =
+        "I think you might mean $name — is that right? Say yes to call, or cancel."
+
+    /**
+     * Prompt for multiple phonetic / low-confidence candidates.
+     * Reuses the same numbered list as [fuzzyMatchPrompt] so the answer-parsing
+     * logic in [parseOrdinal] and [parseContextualSelection] works uniformly.
+     */
+    fun phoneticMatchesPrompt(names: List<String>): String {
+        val options = names.mapIndexed { i, n -> "${ordinal(i + 1)}, $n" }.joinToString(". ")
+        return "I couldn't find an exact match — did you mean: $options? Say the number, or cancel."
+    }
+
+    // ── Phase B: contextual selection ────────────────────────────────────────
+
+    /**
+     * Words and phrases treated as "yes, I confirm the only candidate" when there is
+     * exactly ONE contact or phone number awaiting selection.
+     * These are NOT safe to use as implicit selection with multiple candidates —
+     * "yes" with two contacts present is ambiguous.
+     */
+    private val SINGLE_CANDIDATE_PHRASES = setOf(
+        "that one", "that's right", "that's the one", "yes that one", "yeah that one",
+        "call them", "call that one", "them",
+    )
+
+    /**
+     * Phrases that mean "the final / last option in the list".
+     * Valid for any list size ≥ 1.
+     */
+    private val LAST_PHRASES = setOf(
+        "last", "last one", "final", "final one", "last option",
+    )
+
+    /**
+     * Phrases that mean "the option other than the first one", valid ONLY when exactly
+     * two candidates are present.  With three or more options the meaning is ambiguous.
+     * Note: "not that one" is intentionally absent — it is already in [DENY_WORDS] and
+     * should trigger cancellation rather than implicit selection.
+     */
+    private val OTHER_PHRASES = setOf(
+        "other", "other one", "different one", "the other",
+    )
+
+    /**
+     * Parse a natural-language contextual selection from a candidate list of size
+     * [candidateCount].  Returns a 1-based index when the answer is unambiguous, or
+     * null when it cannot be resolved safely.
+     *
+     * Unlike [parseOrdinal] (which parses "one", "two", "1st", etc.), this function
+     * handles relative references and single-candidate confirmations:
+     *
+     *  - "yes" / "correct" / "that one" → index 1, ONLY when [candidateCount] == 1.
+     *    When multiple candidates are present, "yes" is ambiguous and returns null so
+     *    the conversation can ask for clarification rather than guessing.
+     *  - "the last one" / "last" → index [candidateCount] (always unambiguous).
+     *  - "the other one" / "other one" → index 2, ONLY when [candidateCount] == 2.
+     *    With three or more options the word "other" is ambiguous.
+     *
+     * This method must be called AFTER [parseOrdinal] returns null and BEFORE falling
+     * through to [isDenial] / general AI routing, so that the pending stage is preserved
+     * rather than abandoned on natural answers like "yes" or "the last one".
+     */
+    fun parseContextualSelection(text: String, candidateCount: Int): Int? {
+        if (candidateCount <= 0) return null
+        val n = normalizeAnswer(text)
+        return when {
+            // Confirmation phrases select candidate 1 ONLY for a single-candidate list.
+            // "yes" with two contacts present means "yes I understand the question" — ambiguous.
+            candidateCount == 1 && (n in CONFIRM_WORDS || n in SINGLE_CANDIDATE_PHRASES) -> 1
+            // "the last one" / "last" — last candidate in the list, always unambiguous.
+            n in LAST_PHRASES && candidateCount >= 1 -> candidateCount
+            // "the other one" — unambiguous only when exactly two candidates remain.
+            n in OTHER_PHRASES && candidateCount == 2 -> 2
+            else -> null
+        }
+    }
 }

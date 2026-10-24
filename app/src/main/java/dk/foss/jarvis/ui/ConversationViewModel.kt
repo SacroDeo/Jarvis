@@ -582,7 +582,10 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
     private fun handleCallStageAnswer(text: String) {
         when (val stage = callStage) {
             is CallStage.ClarifyContacts -> {
+                // Try numeric ordinal first ("one", "two", "1st", …), then contextual
+                // phrases ("yes" for a single candidate, "the last one", "the other one").
                 val idx = CallFlowPolicy.parseOrdinal(text)
+                    ?: CallFlowPolicy.parseContextualSelection(text, stage.candidates.size)
                 if (idx != null && idx in 1..stage.candidates.size) {
                     val contact = stage.candidates[idx - 1]
                     cancelCallFlow()
@@ -609,13 +612,15 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                     streamDone = true
                     pump()
                 } else {
-                    // Not a recognised ordinal — treat as a fresh request.
+                    // Not a recognised ordinal or contextual selection — treat as a fresh request.
                     cancelCallFlow()
                     think(text)
                 }
             }
             is CallStage.ClarifyNumbers -> {
+                // Try numeric ordinal first, then contextual phrases for the numbers list.
                 val idx = CallFlowPolicy.parseOrdinal(text)
+                    ?: CallFlowPolicy.parseContextualSelection(text, stage.contact.numbers.size)
                 if (idx != null && idx in 1..stage.contact.numbers.size) {
                     val number = stage.contact.numbers[idx - 1]
                     cancelCallFlow()
@@ -1425,6 +1430,18 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
                         reply.value = prompt
                         speakAndListenForStage(prompt)
                     }
+                }
+                is LookupResult.PhoneticMatches -> {
+                    // Low-confidence edit-distance match.  ALWAYS ask for confirmation,
+                    // even when there is only one candidate — never auto-dial.
+                    callStage = CallStage.ClarifyContacts(contactName, result.contacts)
+                    val prompt = if (result.contacts.size == 1) {
+                        CallFlowPolicy.phoneticMatchPrompt(result.contacts[0].displayName)
+                    } else {
+                        CallFlowPolicy.phoneticMatchesPrompt(result.contacts.map { it.displayName })
+                    }
+                    reply.value = prompt
+                    speakAndListenForStage(prompt)
                 }
                 is LookupResult.NotFound -> {
                     roundTripReask("No contact named \"$contactName\" was found. Ask the user for a more specific name.")

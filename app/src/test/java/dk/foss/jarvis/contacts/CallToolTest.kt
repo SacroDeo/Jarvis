@@ -1337,3 +1337,382 @@ class DeepLinkToolSchemaTest {
         assertTrue(out is ToolRegistry.Outcome.Reply)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2A — ContactResolver.normalizeForMatching
+// Tests the Unicode diacritic-stripping normalization that underpins phonetic
+// matching.  No Android dependencies — pure java.text.Normalizer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ContactResolverNormalizeTest {
+
+    private fun norm(s: String) = ContactResolver.normalizeForMatching(s)
+
+    @Test fun `ASCII lowercase unchanged`() {
+        assertEquals("papa", norm("papa"))
+    }
+
+    @Test fun `ASCII uppercase lowercased`() {
+        assertEquals("papa", norm("Papa"))
+        assertEquals("rahul sharma", norm("Rahul Sharma"))
+    }
+
+    @Test fun `leading and trailing whitespace stripped`() {
+        assertEquals("papa", norm("  Papa  "))
+    }
+
+    @Test fun `umlaut a stripped — Päppä → pappa`() {
+        assertEquals("pappa", norm("Päppä"))
+    }
+
+    @Test fun `acute e stripped — María → maria`() {
+        assertEquals("maria", norm("María"))
+    }
+
+    @Test fun `tilde n stripped — Martínez → martinez`() {
+        assertEquals("martinez", norm("Martínez"))
+    }
+
+    @Test fun `cedilla stripped — François → francois`() {
+        assertEquals("francois", norm("François"))
+    }
+
+    @Test fun `multiple diacritics in one name`() {
+        assertEquals("jose garcia", norm("José García"))
+    }
+
+    @Test fun `empty string returns empty`() {
+        assertEquals("", norm(""))
+    }
+
+    @Test fun `ASCII-only name unchanged after normalization`() {
+        assertEquals("john smith", norm("John Smith"))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2A — ContactResolver.levenshtein
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ContactResolverLevenshteinTest {
+
+    private fun lev(a: String, b: String) = ContactResolver.levenshtein(a, b)
+
+    @Test fun `identical strings → 0`() {
+        assertEquals(0, lev("papa", "papa"))
+    }
+
+    @Test fun `empty vs non-empty → length of non-empty`() {
+        assertEquals(4, lev("", "papa"))
+        assertEquals(4, lev("papa", ""))
+    }
+
+    @Test fun `one insertion — papa → pappa`() {
+        // "pappa" = "papa" + insert 'p' → distance 1
+        assertEquals(1, lev("papa", "pappa"))
+        assertEquals(1, lev("pappa", "papa"))
+    }
+
+    @Test fun `one substitution — papa → bapa`() {
+        assertEquals(1, lev("papa", "bapa"))
+    }
+
+    @Test fun `two substitutions — papa → baba`() {
+        assertEquals(2, lev("papa", "baba"))
+    }
+
+    @Test fun `paapa → papa — one insertion`() {
+        assertEquals(1, lev("paapa", "papa"))
+        assertEquals(1, lev("papa", "paapa"))
+    }
+
+    @Test fun `completely different short words`() {
+        assertEquals(4, lev("john", "papa"))
+    }
+
+    @Test fun `rahul → rahu — one deletion`() {
+        assertEquals(1, lev("rahul", "rahu"))
+    }
+
+    @Test fun `symmetry holds`() {
+        assertEquals(lev("pappa", "papa"), lev("papa", "pappa"))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2A — ContactResolver.isPhoneticMatch
+// Verifies the combined normalization + edit-distance matching used by the
+// phonetic tier.  All functions are internal and tested without Android context.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ContactResolverPhoneticTest {
+
+    private fun phonetic(dn: String, q: String) =
+        ContactResolver.isPhoneticMatch(dn, q)
+
+    // ── Core "pappa → Papa" scenarios ────────────────────────────────────────
+
+    @Test fun `pappa matches Papa — one edit after normalization`() {
+        // normalize("pappa")="pappa", normalize("Papa")="papa", levenshtein=1, threshold=1
+        assertTrue(phonetic("Papa", "pappa"))
+    }
+
+    @Test fun `paapa matches Papa — one edit after normalization`() {
+        // normalize("paapa")="paapa", normalize("Papa")="papa", levenshtein=1, threshold=1
+        assertTrue(phonetic("Papa", "paapa"))
+    }
+
+    @Test fun `papa matches Pappa — one edit after normalization`() {
+        // normalize("papa")="papa", normalize("Pappa")="pappa", levenshtein=1, threshold=1
+        assertTrue(phonetic("Pappa", "papa"))
+    }
+
+    @Test fun `Päppä matches pappa after diacritic normalization`() {
+        // normalize("Päppä")="pappa", normalize("pappa")="pappa" → same → isPhoneticMatch returns false
+        // (identical after normalization = already an exact match; handled upstream)
+        assertFalse("Normalized identical strings are not phonetic — they are exact matches",
+            phonetic("Päppä", "pappa"))
+    }
+
+    // ── Exact matches are excluded from phonetic tier ─────────────────────────
+
+    @Test fun `papa vs Papa — identical after normalization, not phonetic`() {
+        // Exact match case: caller should have returned ExactUnique already.
+        assertFalse("Exact matches must not appear as phonetic", phonetic("Papa", "papa"))
+    }
+
+    @Test fun `rahul vs rahul — identical, not phonetic`() {
+        assertFalse(phonetic("Rahul", "rahul"))
+    }
+
+    // ── Short query guard ─────────────────────────────────────────────────────
+
+    @Test fun `two-char query below PHONETIC_MIN_QUERY_LEN returns false`() {
+        assertFalse(phonetic("Papa", "pa"))
+    }
+
+    @Test fun `one-char query returns false`() {
+        assertFalse(phonetic("Papa", "p"))
+    }
+
+    // ── Unrelated names rejected ──────────────────────────────────────────────
+
+    @Test fun `baba does not match Papa — distance 2 exceeds threshold 1`() {
+        // normalize("baba")="baba", normalize("Papa")="papa", levenshtein=2, threshold=5/3=1
+        assertFalse(phonetic("Papa", "baba"))
+    }
+
+    @Test fun `john does not match Papa — completely unrelated`() {
+        assertFalse(phonetic("Papa", "john"))
+    }
+
+    @Test fun `completely different long names rejected`() {
+        // normalize("benjamin")="benjamin" (len 8), normalize("victoria")="victoria", lev=7, threshold=2
+        assertFalse(phonetic("Victoria", "benjamin"))
+    }
+
+    // ── Token-level matching (first name vs "First Last") ─────────────────────
+
+    @Test fun `pappa matches Papa Sharma via first-name token`() {
+        // "Papa Sharma" tokens=["papa","sharma"]; levenshtein("papa","pappa")=1 ≤ threshold=1
+        assertTrue(phonetic("Papa Sharma", "pappa"))
+    }
+
+    @Test fun `rahul matches Rahul Gupta via first token`() {
+        // normalize query="rahul", token "rahul"="rahul", same → exact-match guard skips token?
+        // No: the token check uses levenshtein, not equality. levenshtein("rahul","rahul")=0 ≤ 1.
+        // But then the full-name check also triggers: "rahul gupta" vs "rahul" → lev=6 > threshold.
+        // Token check: "rahul" vs "rahul" → lev=0 ≤ threshold=1 → true
+        assertTrue(phonetic("Rahul Gupta", "rahul"))
+    }
+
+    // ── Threshold scales with query length ───────────────────────────────────
+
+    @Test fun `3-char query has threshold 1`() {
+        // "ali" (len 3), threshold = 3/3 = 1
+        // "Aly" vs "ali": normalize("Aly")="aly", lev("aly","ali")=1 ≤ 1 → true
+        assertTrue(phonetic("Aly", "ali"))
+        // "Bob" vs "ali": lev("bob","ali")=3 > 1 → false
+        assertFalse(phonetic("Bob", "ali"))
+    }
+
+    @Test fun `9-char query has threshold 3 (max)`() {
+        // "abhishekk" (len 9), threshold = 9/3 = 3
+        // "Abhishek" (8 chars) vs query: lev("abhishek","abhishekk")=1 ≤ 3 → true
+        assertTrue(phonetic("Abhishek", "abhishekk"))
+    }
+
+    // ── Multiple-candidate safety ─────────────────────────────────────────────
+
+    @Test fun `isPhoneticMatch returns false for unrelated names even at higher thresholds`() {
+        // 10-char query, threshold=3; completely different name should still fail
+        assertFalse(phonetic("Maria", "johnsmith0"))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2A — CallFlowPolicy phonetic-match prompts
+// ─────────────────────────────────────────────────────────────────────────────
+
+class CallFlowPolicyPhoneticPromptTest {
+
+    @Test fun `phoneticMatchPrompt mentions candidate name`() {
+        val prompt = CallFlowPolicy.phoneticMatchPrompt("Papa")
+        assertTrue("Prompt must mention candidate name", prompt.contains("Papa"))
+        assertTrue("Prompt must invite confirmation", prompt.contains("yes") || prompt.contains("right"))
+    }
+
+    @Test fun `phoneticMatchesPrompt lists all candidates`() {
+        val prompt = CallFlowPolicy.phoneticMatchesPrompt(listOf("Papa", "Paapa"))
+        assertTrue(prompt.contains("Papa"))
+        assertTrue(prompt.contains("Paapa"))
+        assertTrue(prompt.contains("one") || prompt.contains("1"))
+        assertTrue(prompt.contains("two") || prompt.contains("2"))
+    }
+
+    @Test fun `phoneticMatchPrompt single name — not asking to pick from list`() {
+        val single = CallFlowPolicy.phoneticMatchPrompt("Rahul")
+        // Should NOT look like a numbered list for single candidate
+        assertTrue(single.contains("Rahul"))
+        assertTrue(single.length < 200)  // sanity: concise
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2B — CallFlowPolicy.parseContextualSelection
+// Tests the natural-language selection resolution that supplements parseOrdinal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class CallFlowPolicyContextualSelectionTest {
+
+    private fun ctx(text: String, count: Int) =
+        CallFlowPolicy.parseContextualSelection(text, count)
+
+    // ── "yes" and confirmation words ─────────────────────────────────────────
+
+    @Test fun `yes selects candidate 1 when exactly one candidate`() {
+        assertEquals(1, ctx("yes", 1))
+    }
+
+    @Test fun `yeah selects candidate 1 when exactly one candidate`() {
+        assertEquals(1, ctx("yeah", 1))
+    }
+
+    @Test fun `correct selects candidate 1 when exactly one candidate`() {
+        assertEquals(1, ctx("correct", 1))
+    }
+
+    @Test fun `ok selects candidate 1 when exactly one candidate`() {
+        assertEquals(1, ctx("ok", 1))
+    }
+
+    @Test fun `that one selects candidate 1 when exactly one candidate`() {
+        assertEquals(1, ctx("that one", 1))
+    }
+
+    @Test fun `yes is null when two candidates — ambiguous`() {
+        assertNull("yes with two candidates is ambiguous — must not select",
+            ctx("yes", 2))
+    }
+
+    @Test fun `yes is null when three candidates — ambiguous`() {
+        assertNull(ctx("yes", 3))
+    }
+
+    @Test fun `that one is null when two candidates — ambiguous`() {
+        assertNull(ctx("that one", 2))
+    }
+
+    // ── "the last one" ───────────────────────────────────────────────────────
+
+    @Test fun `last one selects final candidate from two-item list`() {
+        assertEquals(2, ctx("last one", 2))
+    }
+
+    @Test fun `the last one selects final candidate from three-item list`() {
+        // normalizeAnswer strips leading "the " → "last one"
+        assertEquals(3, ctx("the last one", 3))
+    }
+
+    @Test fun `last selects final candidate`() {
+        assertEquals(5, ctx("last", 5))
+    }
+
+    @Test fun `final one selects final candidate`() {
+        assertEquals(4, ctx("final one", 4))
+    }
+
+    @Test fun `last one with single candidate selects it`() {
+        assertEquals(1, ctx("last one", 1))
+    }
+
+    // ── "the other one" ──────────────────────────────────────────────────────
+
+    @Test fun `the other one selects candidate 2 when exactly two candidates`() {
+        // normalizeAnswer strips "the " → "other one" is in OTHER_PHRASES
+        assertEquals(2, ctx("the other one", 2))
+    }
+
+    @Test fun `other one selects candidate 2 when exactly two candidates`() {
+        assertEquals(2, ctx("other one", 2))
+    }
+
+    @Test fun `other selects candidate 2 when exactly two candidates`() {
+        assertEquals(2, ctx("other", 2))
+    }
+
+    @Test fun `the other one is null when three candidates — ambiguous`() {
+        assertNull("'the other one' is ambiguous with 3 candidates",
+            ctx("the other one", 3))
+    }
+
+    @Test fun `other one is null when four candidates — ambiguous`() {
+        assertNull(ctx("other one", 4))
+    }
+
+    // ── Invalid ordinals and unrelated answers ────────────────────────────────
+
+    @Test fun `empty string returns null`() {
+        assertNull(ctx("", 1))
+    }
+
+    @Test fun `zero candidateCount returns null`() {
+        assertNull(ctx("yes", 0))
+    }
+
+    @Test fun `negative candidateCount returns null`() {
+        assertNull(ctx("yes", -1))
+    }
+
+    @Test fun `unrecognised phrase returns null`() {
+        assertNull(ctx("maybe", 1))
+        assertNull(ctx("hmm", 2))
+        assertNull(ctx("call later", 1))
+    }
+
+    @Test fun `denial phrases return null (handled separately by isDenial)`() {
+        // "no" and "cancel" must not be treated as selections — they are handled by isDenial
+        assertNull(ctx("no", 1))
+        assertNull(ctx("cancel", 2))
+    }
+
+    // ── Integration: parseOrdinal and parseContextualSelection together ───────
+
+    @Test fun `parseOrdinal still handles numbered responses — contextual does not interfere`() {
+        // parseOrdinal("two") = 2; parseContextualSelection("two", 3) should also return 2
+        // (cardinals are handled by parseOrdinal; this just confirms no conflict)
+        assertEquals(2, CallFlowPolicy.parseOrdinal("two"))
+        // contextual selection does NOT intercept ordinals — parseOrdinal gets first shot
+        // in handleCallStageAnswer; this test shows the ordering is safe
+        assertEquals(null, ctx("two", 3))  // "two" not in contextual sets
+    }
+
+    // ── Cancellation behavior unaffected ────────────────────────────────────
+
+    @Test fun `isDenial still works independently`() {
+        assertTrue(CallFlowPolicy.isDenial("cancel"))
+        assertTrue(CallFlowPolicy.isDenial("no"))
+        assertTrue(CallFlowPolicy.isDenial("stop"))
+        assertFalse(CallFlowPolicy.isDenial("yes"))
+    }
+}
