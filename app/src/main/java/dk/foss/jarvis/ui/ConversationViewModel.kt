@@ -283,12 +283,43 @@ class ConversationViewModel(app: Application) : AndroidViewModel(app) {
             tts = if (s.useElevenLabs) {
                 ElevenLabsTts(getApplication(), s.elevenKey, s.elevenVoiceId)
             } else {
-                // Only an explicit in-app choice is honoured.  A missing, blank, or corrupted
-                // pref degrades to the engine's system-configured voice — never throw
-                // and kill ensureReady().
-                val voice = s.ttsVoiceUserId
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { runCatching { Json { ignoreUnknownKeys = true }.decodeFromString(TtsVoice.serializer(), it) }.getOrNull() }
+                // Resolve the TTS voice for this session.
+                //
+                // Priority (highest to lowest):
+                //   1. Explicit user choice saved in DataStore (tts_voice_user / tts_voice_id).
+                //   2. Auto-selected male English voice (fresh install or wiped DataStore).
+                //   3. Android system default voice (no male English voice found on device).
+                //
+                // The auto-selection path (2) runs on Dispatchers.IO to avoid blocking the
+                // main thread: AndroidTts.getAvailableVoices() creates a temporary TTS engine
+                // and waits briefly for it to initialise.  The chosen voice is persisted to
+                // DataStore so subsequent sessions reuse it without re-enumerating, and so it
+                // survives future APK updates that preserve app data (adb install -r).
+                //
+                // runCatching wraps both the DataStore write and the JSON decode so that a
+                // storage or parse failure can never crash ensureReady().
+                val voice: TtsVoice? = if (s.ttsVoiceUserId?.isNotBlank() == true) {
+                    // Explicit saved preference — decode and use it.
+                    // ttsVoiceUserId is non-null here (the isNotBlank guard above confirms it),
+                    // but we use orEmpty() to keep the compiler happy without a force-unwrap.
+                    runCatching {
+                        Json { ignoreUnknownKeys = true }
+                            .decodeFromString(TtsVoice.serializer(), s.ttsVoiceUserId.orEmpty())
+                    }.getOrNull()
+                } else {
+                    // No saved preference (fresh install, data wipe, or user cleared choice).
+                    // Attempt to auto-select a suitable male English voice.
+                    val fallback = withContext(Dispatchers.IO) {
+                        val voices = AndroidTts.getAvailableVoices(getApplication())
+                        AndroidTts.selectBestMaleEnglishVoice(voices)
+                    }
+                    if (fallback != null) {
+                        // Persist for future sessions.  runCatching: a DataStore failure
+                        // must not block TTS from initialising.
+                        runCatching { settingsStore.updateTtsVoice(fallback) }
+                    }
+                    fallback
+                }
                 val androidTts = AndroidTts(getApplication(), languageTag = null, voice = voice)
                 // applyVoiceIfNeeded() handles the case where TTS initialised synchronously
                 // (rare). The real work is done inside the TTS init callback, which picks up

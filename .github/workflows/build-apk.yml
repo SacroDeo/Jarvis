@@ -64,6 +64,86 @@ jobs:
             >> gradle.properties
           echo 'org.gradle.daemon=false' >> gradle.properties
 
+      # ── 5b. Stable debug signing keystore ──────────────────────────────────
+      # Android's automatic debug signing reads ~/.android/debug.keystore.
+      # Every fresh CI runner generates a NEW keystore, producing a different
+      # signing certificate from locally-built APKs.  Installing such an APK
+      # over an existing installation fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE
+      # and forces an uninstall, wiping all app data and runtime permission grants.
+      #
+      # This step restores the developer's own debug keystore from the repository
+      # secret DEBUG_KEYSTORE_BASE64 so every CI APK is signed with the same
+      # certificate as locally-built APKs.  The build FAILS if the secret is not
+      # configured so the mismatch is caught early and loudly rather than silently
+      # producing an incompatible APK.
+      #
+      # ── ONE-TIME SETUP (performed by the repository owner) ──────────────────
+      #
+      # 1. Encode your local debug keystore to Base64 in PowerShell:
+      #
+      #      $ks = "$env:USERPROFILE\.android\debug.keystore"
+      #      [Convert]::ToBase64String([IO.File]::ReadAllBytes($ks)) |
+      #        Out-File -NoNewline -Encoding ascii "$env:TEMP\debug_ks.b64"
+      #      Write-Host "Saved to $env:TEMP\debug_ks.b64"
+      #
+      #    Do NOT paste the output into chat, email, or any source file.
+      #
+      # 2. Add it as a GitHub Actions repository secret:
+      #    a. Open:  https://github.com/SacroDeo/Jarvis/settings/secrets/actions
+      #    b. Click "New repository secret"
+      #    c. Name:  DEBUG_KEYSTORE_BASE64
+      #    d. Value: paste the entire contents of debug_ks.b64 (one long Base64 line)
+      #    e. Click "Add secret", then delete debug_ks.b64 from your machine.
+      #
+      # 3. Verify the fingerprint after the next CI run matches your local APK:
+      #    Local APK:  apksigner verify --print-certs app-debug.apk  (local build)
+      #    CI APK:     apksigner verify --print-certs app-debug.apk  (CI artifact)
+      #    Both SHA-256 values must be identical.
+      #
+      # ── SECURITY NOTE ──────────────────────────────────────────────────────
+      # The Android debug keystore uses publicly known credentials
+      # (alias: androiddebugkey, storepass: android, keypass: android).
+      # It provides identity continuity — not cryptographic protection.
+      # Never use a debug keystore for release APKs.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Restore debug signing keystore
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_B64" ]; then
+            echo "::error title=Missing secret::DEBUG_KEYSTORE_BASE64 is not configured."
+            echo "::error::Without it every CI build uses a new ephemeral key that differs"
+            echo "::error::from your local debug key.  Installing the CI APK would require"
+            echo "::error::uninstalling the existing app, wiping all app data."
+            echo "::error::See the setup instructions in .github/workflows/build-apk.yml."
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          # Decode without printing: printf writes the decoded bytes to the file.
+          # base64 --decode reads from stdin; the secret is passed via env var only.
+          printf '%s' "$DEBUG_KEYSTORE_B64" | base64 --decode > "$HOME/.android/debug.keystore"
+          if [ ! -s "$HOME/.android/debug.keystore" ]; then
+            echo "::error::Decoded keystore is empty — the secret value may be corrupt."
+            exit 1
+          fi
+          # Verify the keystore contains the expected alias using the JDK installed
+          # by the setup-java step above.  keytool output goes to stdout only; the
+          # secret (keystore bytes) is never printed.
+          if ! "$JAVA_HOME/bin/keytool" -list \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -noprompt 2>&1 | grep -q "androiddebugkey"; then
+            echo "::error::Restored keystore does not contain alias 'androiddebugkey'."
+            echo "::error::Ensure DEBUG_KEYSTORE_BASE64 encodes your ~/.android/debug.keystore."
+            exit 1
+          fi
+          echo "Debug keystore restored and verified (alias: androiddebugkey)."
+        env:
+          # Pass the secret via environment variable so it is never echoed by the
+          # shell's command expansion.  GitHub Actions masks secret values in logs,
+          # but defence-in-depth: the variable is never referenced with ${{ }} in
+          # a position that would cause it to appear in the shell's xtrace output.
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+
       # ── 6. Unit tests ──────────────────────────────────────────────────────
       # Run the full JVM unit-test suite before building the APK so a test
       # failure blocks the build immediately.  --continue lets all test classes
@@ -90,7 +170,22 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      # ── 9. Artifact ────────────────────────────────────────────────────────
+      # ── 9. Verify APK signing certificate ──────────────────────────────────
+      # Print the certificate fingerprint so the CI log carries a permanent
+      # record of which key signed this APK.  This line is visible in the
+      # workflow log and can be compared to the local APK fingerprint.
+      # Expected SHA-256: c54247a2a4dabc45defb7f2aa03bfc22ba46cac5d2fe5649d0ab10177341f147
+      - name: Print APK signing fingerprint
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ -f "$APK" ]; then
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK" \
+              | grep -E "SHA-256|SHA-1|certificate DN"
+          else
+            echo "APK not found — assembleDebug may have failed."
+          fi
+
+      # ── 10. Artifact ────────────────────────────────────────────────────────
       # The APK is uploaded as a GitHub Actions artifact and can be downloaded
       # from the workflow run page.  It is retained for 30 days.
       - name: Upload debug APK
